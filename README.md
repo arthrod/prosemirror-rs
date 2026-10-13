@@ -70,6 +70,33 @@ cargo test --lib
 cargo test test_resolve
 ```
 
+## Markdown
+
+[`prosemirror::markdown`](src/markdown/mod.rs) ports
+[prosemirror-remark](https://github.com/arthrod/prosemirror-remark): a CommonMark
+and GitHub Flavored Markdown schema plus bidirectional conversion. Parsing uses
+[pulldown-cmark](https://docs.rs/pulldown-cmark), the same engine as
+[markdown-remarkable](https://github.com/arthrod/markdown-remarkable). Output
+matches `remark-stringify` with `fences: true`, `listItemIndent: "one"`,
+`rule: "-"`, and `*` bullets.
+
+```rust
+use prosemirror::markdown::Remark;
+
+let remark = Remark::gfm();
+let parsed = remark.parse("- [x] done\n");
+assert_eq!(remark.serialize(&parsed.doc), "* [x] done\n");
+```
+
+Node and mark names match `prosemirror-remark` (`paragraph`, `heading`,
+`bullet_list`, `task_list_item`, `link`, `strikethrough`, …). Input rules,
+keymaps, and the task-list checkbox node view are not included: they depend on
+`prosemirror-state`, `prosemirror-view`, `prosemirror-commands`, and
+`prosemirror-inputrules`, which this crate does not implement.
+
+Same gaps as upstream: raw HTML is dropped, a fenced code block's info string
+is not stored, and tables and footnotes are not in the schema.
+
 ## Performance
 
 The Rust implementation is significantly faster and more memory-efficient than
