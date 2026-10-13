@@ -89,10 +89,14 @@ assert_eq!(remark.serialize(&parsed.doc), "* [x] done\n");
 ```
 
 Node and mark names match `prosemirror-remark` (`paragraph`, `heading`,
-`bullet_list`, `task_list_item`, `link`, `strikethrough`, …). Input rules,
-keymaps, and the task-list checkbox node view are not included: they depend on
-`prosemirror-state`, `prosemirror-view`, `prosemirror-commands`, and
-`prosemirror-inputrules`, which this crate does not implement.
+`bullet_list`, `task_list_item`, `link`, `strikethrough`, …).
+[`Editor`](src/markdown/edit.rs) runs the syntax-extension input rules and
+keymap on that schema: headings, lists, task items, marks, code blocks, rules,
+and hard breaks. [`parse_dom`](src/markdown/dom.rs) / [`to_dom`](src/markdown/dom.rs)
+follow the `parseDOM` / `toDOM` specs, including the task-list checkbox.
+There is no browser view, so scrolling and layout-sensitive `endOfTextblock`
+are not represented; `is_at_start` uses the no-view fallback
+(`parentOffset == 0`).
 
 Same gaps as upstream: raw HTML is dropped, a fenced code block's info string
 is not stored, and tables and footnotes are not in the schema.

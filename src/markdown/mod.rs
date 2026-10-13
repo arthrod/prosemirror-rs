@@ -24,19 +24,13 @@
 //!
 //! # Editor features
 //!
-//! Input rules, keymaps, and the task-list checkbox node view are not part of
-//! this crate. They depend on `prosemirror-state`, `prosemirror-view`,
-//! `prosemirror-commands`, `prosemirror-inputrules`, and `prosemirror-schema-list`.
-//! The node and mark names match upstream, so those bindings can target this schema:
-//!
-//! * Headings: input `# `–`###### `; `Shift-Mod-1`…`6`, `Tab` / `Shift-Tab`.
-//! * Blockquotes: `> `, `Mod->`.
-//! * Code blocks: fence or four spaces, `Shift-Mod-\`, `Enter` to lift out.
-//! * Rules: `---`, `***`, `___`, `Mod-_`.
-//! * Lists: `Shift-Mod-8` / `Shift-Mod-9`, `Enter`, `Tab`, `Shift-Tab`.
-//! * Bold `Mod-b`, italic `Mod-i`, code `` Ctrl-` ``.
-//! * Task items: `[ ]` / `[x]` at the start of an item; `Backspace` there turns
-//!   a task item back into a regular item.
+//! [`Editor`](edit::Editor) runs the input rules and keymap from the syntax
+//! extensions on top of this schema: headings, lists, task items, marks, code
+//! blocks, rules, and hard breaks. [`dom`] serializes and parses the `toDOM` /
+//! `parseDOM` specs, including the task-list checkbox. There is no browser
+//! view, so scrolling and layout-sensitive `endOfTextblock` are not
+//! represented; [`is_at_start`](edit::is_at_start) uses the no-view fallback
+//! (`parentOffset == 0`).
 //!
 //! # Known gaps
 //!
@@ -44,11 +38,22 @@
 //! not stored, and tables and footnotes are not in the schema.
 
 mod convert;
+mod dom;
+mod edit;
 mod md;
 mod parse;
 mod schema;
 mod stringify;
 
+pub use dom::{
+    click_task_checkbox, parse_dom, task_stops_event, to_dom, to_node_view, DomElement, DomNode,
+    TaskEventTarget,
+};
+pub use edit::{
+    add_mark_to_nodes, is_at_start, is_at_start_in, is_list_spread, resolve_references,
+    unified_extensions, DocState, Editor, Key, ReferenceDefinition, TextSelection,
+    UnifiedExtensions,
+};
 pub use schema::Flavor;
 
 use crate::dynamic::{DynamicNode, DynamicSchema};
@@ -134,5 +139,7 @@ impl Remark {
     }
 }
 
+#[cfg(test)]
+mod editor_tests;
 #[cfg(test)]
 mod tests;
