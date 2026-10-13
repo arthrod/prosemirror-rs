@@ -1,0 +1,12 @@
+[package]
+name = "remarkable-engine"
+version = "0.5.2"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "ProseMirror document engine for the vendored markdown-remarkable viewer"
+
+[dependencies]
+prosemirror = { path = "../.." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

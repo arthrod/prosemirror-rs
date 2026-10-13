@@ -1,0 +1,3220 @@
+//! Markdown -> HTML rendering and the surrounding HTML page template.
+//!
+//! Everything in this module is a pure function: no I/O, no network. That
+//! keeps it trivially unit-testable and keeps `server.rs` a thin adapter
+//! that reads a file, calls into here, and writes the response.
+
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use pulldown_cmark::{html, Alignment, CowStr, Event, Options, Parser, Tag, TagEnd};
+use sha2::{Digest, Sha256};
+use std::ops::Range;
+
+/// Bytes left unencoded when percent-encoding a local image's relative path
+/// for the `p` query value in a `/asset?p=...` target — see
+/// [`rewrite_local_image_target`]. Starting from [`NON_ALPHANUMERIC`] (which
+/// would otherwise also encode `/`, making a subdirectory reference like
+/// `imgs/a.png` unreadable as a path once decoded) and keeping `/`, `.`,
+/// `-`, `_` unescaped is enough for a safe, round-trippable query value —
+/// `routes::handle_asset` percent-decodes it right back before ever
+/// touching the filesystem, so this doesn't need to be a path-segment-exact
+/// encoder, just an unambiguous one.
+const IMAGE_PATH_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'/')
+    .remove(b'.')
+    .remove(b'-')
+    .remove(b'_');
+
+/// The bundled GitHub-flavored stylesheet, embedded at compile time so the
+/// binary needs no external assets at runtime.
+const STYLE_CSS: &str = include_str!("../assets/style.css");
+
+/// The bundled viewer client script (zoom + reading width +
+/// `window.__mdviewViewer`),
+/// embedded at compile time. Injected right before [`LIVE_JS`] whenever
+/// live-reload is requested — see [`page`].
+const VIEWER_JS: &str = include_str!("../assets/viewer.js");
+
+/// The bundled live-reload client script, embedded at compile time. Only
+/// injected into the page when live-reload is requested (see [`page`]).
+const LIVE_JS: &str = include_str!("../assets/live.js");
+
+/// The bundled review-comments client script, embedded at compile time.
+/// Injected alongside [`LIVE_JS`] whenever live-reload is requested — the
+/// review pane only makes sense on a live view (`--export`'s static HTML
+/// has nowhere to `PUT` comments to).
+const REVIEW_JS: &str = include_str!("../assets/review.js");
+
+/// The bundled file-tree client script, embedded at compile time. Injected
+/// alongside [`LIVE_JS`]/[`REVIEW_JS`] whenever live-reload is requested —
+/// the tree pane only makes sense on a live view (it fetches `GET /tree`
+/// and `PUT`s `/open`, neither of which exists behind `--export`'s static
+/// HTML).
+const TREE_JS: &str = include_str!("../assets/tree.js");
+
+/// Content-Security-Policy applied to every rendered page. There is no
+/// external network access at all (everything is inlined at compile time),
+/// so this is deliberately as strict as `default-src 'none'` plus the exact
+/// exceptions the page actually needs: inline `<style>`/`<script>` (both
+/// embedded, never user-controlled), `connect-src 'self'` for the
+/// live-reload script's `fetch('/version')`, and images.
+///
+/// `img-src` defaults to `data: 'self'` — an `http(s):` image target in the
+/// document renders as a *broken* `<img>` (nothing is fetched) unless the
+/// caller explicitly opts in via `allow_remote_images`. Loading a remote
+/// image is an outbound request to a URL chosen by whoever wrote the
+/// Markdown, which leaks the viewer's IP (and, via query-string tricks,
+/// potentially which document/comment they're viewing) to that host — the
+/// same "tracking pixel" concern email/RSS clients block by default. `data:`
+/// stays allowed unconditionally: it never leaves the machine, and is
+/// included as defense-in-depth even though `is_safe_link_target` already
+/// rewrites `data:` image targets to `#` today (in case a future change adds
+/// another path for `<img>` markup that doesn't go through that sanitizer).
+/// `'self'` is needed for local images rewritten to `/asset?p=...` by
+/// [`to_html`] (see `rewrite_local_images`) — those requests stay on the
+/// same origin and never leave the machine either.
+fn content_security_policy(allow_remote_images: bool) -> String {
+    let img_src = if allow_remote_images {
+        "data: 'self' http: https:"
+    } else {
+        "data: 'self'"
+    };
+    format!(
+        "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src {img_src}; connect-src 'self'; form-action 'none'"
+    )
+}
+
+/// A single top-level Markdown block (paragraph, heading, list, code block,
+/// table, blockquote, raw HTML block, thematic break, footnote definition,
+/// ...), as identified for review comments. See [`blocks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Block {
+    /// First 16 hex characters of `sha256(source)` — a stable identifier
+    /// for this block's content, used to anchor review comments across
+    /// re-renders. Two blocks with identical (trimmed) source hash the
+    /// same; that's by design.
+    pub hash: String,
+    /// The block's Markdown source, trimmed of leading/trailing whitespace.
+    pub source: String,
+    /// The block's first line, truncated to 80 characters (code fences are
+    /// skipped in favor of the first line of actual code content).
+    pub excerpt: String,
+    /// 1-based line number of the block's first line in the original
+    /// Markdown source. Counts the `\n` characters before the block's
+    /// (untrimmed) start offset — see [`line_range`].
+    pub line_start: usize,
+    /// 1-based line number of the block's last line in the original
+    /// Markdown source, computed after trimming only trailing whitespace
+    /// off the block's source (so a block's own trailing blank lines never
+    /// inflate this) — see [`line_range`].
+    pub line_end: usize,
+}
+
+/// Which of the three kinds of source range an [`Anchor`] identifies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorKind {
+    /// A top-level Markdown block — the same granularity as [`Block`].
+    Block,
+    /// A list item (`Tag::Item`), at any nesting depth.
+    Item,
+    /// A table row, including the header row (`Tag::TableHead` /
+    /// `Tag::TableRow`).
+    Row,
+}
+
+/// A single review-comment anchor: a top-level block, a list item (any
+/// nesting depth), or a table row (including the header row). See
+/// [`anchors`]. `Block` is the pre-existing, coarser granularity ([`Block`]
+/// itself still exists — [`blocks`] is now a thin filter over this); `Item`
+/// and `Row` anchors nest inside a `Block`'s own source range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Anchor {
+    pub kind: AnchorKind,
+    /// First 16 hex characters of `sha256(source)` — see [`Block::hash`].
+    /// Computed by the same function regardless of `kind`, so identical
+    /// (trimmed) source hashes the same whether it came from a block, an
+    /// item, or a row, by design.
+    pub hash: String,
+    /// The anchor's Markdown source, trimmed of leading/trailing
+    /// whitespace. For `Item`, this includes the list marker (`- `, `1. `,
+    /// `- [ ] `, ...) and any nested content (sub-lists, code fences, ...).
+    /// For `Row`, this is the row's raw `| ... |` source line.
+    pub source: String,
+    /// A short, single-line preview. For `Block`, see [`Block::excerpt`].
+    /// For `Item`, the first source line with its list marker stripped,
+    /// truncated to 80 characters. For `Row`, each cell's trimmed raw text
+    /// joined with `" | "`, truncated to 80 characters overall.
+    pub excerpt: String,
+    /// 1-based line number of the anchor's first source line — see
+    /// [`line_range`].
+    pub line_start: usize,
+    /// 1-based line number of the anchor's last source line — see
+    /// [`line_range`].
+    pub line_end: usize,
+    /// Index into the same [`anchors`] result of this anchor's nearest
+    /// enclosing anchor: the containing `Block` for a top-level item/row,
+    /// or the containing `Item` for a nested list item (nesting is
+    /// transparent through non-anchor wrappers like `BlockQuote`/`List`/
+    /// `Table`). `None` only for a `Block`-kind anchor, which has no parent.
+    pub parent: Option<usize>,
+}
+
+/// Converts Markdown source into an HTML fragment (no surrounding
+/// `<html>`/`<body>` scaffolding — see [`page`] for that).
+///
+/// Tables, strikethrough, task lists, and footnotes are enabled.
+///
+/// Two things pulldown-cmark would otherwise hand back unchanged are
+/// neutralized before rendering (see [`sanitize_events`] for details): raw
+/// HTML embedded in the source, and `javascript:`/`data:`-style link or
+/// image targets.
+///
+/// `rewrite_local_images` controls whether a relative (scheme-less,
+/// non-fragment, non-rooted) `<img>` target is additionally rewritten to
+/// `/asset?p=<percent-encoded relative path>` — see [`rewrite_local_image_target`]
+/// — so the live view can serve a local image next to the open document
+/// through `GET /asset` (`routes::handle_asset`). `true` for the live
+/// view (`/` and `/body`, both backed by a running server that can answer
+/// `/asset`); `false` for `--export`'s standalone HTML, which has no
+/// server behind it once written and would otherwise embed a link to a
+/// route that doesn't exist. This never touches [`blocks`]/[`anchors`]'
+/// own `source`/`excerpt` — those are computed straight from the
+/// (unrewritten) Markdown source, not from this function's HTML output.
+///
+/// Every top-level block (as split by [`blocks`]) is wrapped in
+/// `<div class="blk" data-kind="block" data-hash="..." data-line-start="..."
+/// data-line-end="..." data-excerpt="...">...</div>` so the review UI can
+/// locate and mark up individual blocks, and label them with their source
+/// line range. Within a block, every list item (`<li>`, any nesting depth)
+/// and table row (`<tr>`, including the header row) gets the same
+/// `class="anchor" data-kind="item"|"row" data-hash="..." data-line-start="..."
+/// data-line-end="..." data-excerpt="...">` treatment — see [`anchors`] for
+/// the shared range/hash/excerpt logic this and `to_html` both build on,
+/// and [`render_events_html`] for how the wrapper tags are interleaved with
+/// pulldown-cmark's own rendering.
+pub fn to_html(markdown: &str, rewrite_local_images: bool) -> String {
+    let mut html_output = String::new();
+    for (range, events) in parsed_blocks(markdown) {
+        let (line_start, line_end) = line_range(markdown, &range);
+        let source = markdown[range].trim();
+        let hash = hash_source(source);
+
+        // `data-excerpt` lets the review UI (assets/review.js) show a
+        // preview for a block that has no saved comment yet, without
+        // re-deriving one client-side from the rendered HTML text.
+        //
+        // Deliberately *not* `excerpt_of(source)` (the same raw-markdown
+        // excerpt `blocks()` returns): that string is the literal
+        // Markdown source, which for e.g. a link is `[label](url)` —
+        // embedding it here would put a raw `javascript:`/`data:` target
+        // (or, for a raw-HTML block, an `<!-- comment -->`) into the
+        // live page as inert-but-visible attribute text, even though
+        // `sanitize_events` just neutralized/discarded exactly that. The
+        // excerpt used here is built from the block's own sanitized
+        // `Text`/`Code` content instead, so it can only ever contain what
+        // already survived sanitization.
+        let raw_events: Vec<Event<'_>> = events.iter().map(|(e, _)| e.clone()).collect();
+        // `false` here regardless of `rewrite_local_images`: an image's
+        // `dest_url` never shows up in `Text`/`Code` content, so whether it
+        // gets rewritten to `/asset?p=...` can't affect this excerpt either
+        // way — passing the real flag through would be pure noise.
+        let sanitized_for_excerpt = sanitize_events(raw_events, false);
+        let excerpt = plain_text_excerpt(&sanitized_for_excerpt);
+
+        html_output.push_str("<div class=\"blk\" data-kind=\"block\" data-hash=\"");
+        html_output.push_str(&hash);
+        html_output.push_str("\" data-line-start=\"");
+        html_output.push_str(&line_start.to_string());
+        html_output.push_str("\" data-line-end=\"");
+        html_output.push_str(&line_end.to_string());
+        html_output.push_str("\" data-excerpt=\"");
+        html_output.push_str(&escape_html_text(&excerpt));
+        html_output.push_str("\">");
+
+        // `render_events_html` tracks a table's per-column alignments
+        // itself (a stack, pushed on `Start(Tag::Table(_))` and popped on
+        // `End(TagEnd::Table)`) as it scans this block's flat event slice,
+        // so it notices a table nested at *any* depth — inside a
+        // blockquote, a list item, a footnote definition, ... — not only
+        // when the table IS the whole block (i.e. `events[0] ==
+        // Start(Tag::Table(_))`, the only case an earlier version of this
+        // function handled). See its docs for why that state can't just be
+        // recovered from a fresh `push_html` call once a row's cells are
+        // rendered separately from `Start(Tag::Table(_))`.
+        render_events_html(
+            markdown,
+            &events,
+            None,
+            0,
+            rewrite_local_images,
+            &mut html_output,
+        );
+
+        html_output.push_str("</div>\n");
+    }
+    html_output
+}
+
+/// Builds an 80-character, single-line preview from a sanitized event
+/// slice's visible text content only (`Text`/`Code`; nothing else —
+/// certainly not a link/image's `dest_url`, which never appears in `Text`
+/// anyway). Stops at the first line break of any kind (an embedded `\n`
+/// inside a chunk, or a `SoftBreak`/`HardBreak` event) so this is always
+/// one line, the same way `excerpt_of` is for `blocks()`.
+fn plain_text_excerpt(events: &[Event<'_>]) -> String {
+    let mut text = String::new();
+    'events: for event in events {
+        match event {
+            Event::Text(chunk) | Event::Code(chunk) => {
+                for ch in chunk.chars() {
+                    if ch == '\n' {
+                        break 'events;
+                    }
+                    text.push(ch);
+                    if text.chars().count() >= 80 {
+                        break 'events;
+                    }
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => break 'events,
+            _ => {}
+        }
+    }
+    // Leading/trailing whitespace can show up here even though the source
+    // block itself is trimmed — e.g. a comment-stripped HTML block leaves
+    // behind whatever whitespace surrounded the removed `<!--...-->`.
+    text.trim().to_string()
+}
+
+/// The row-anchor analogue of [`plain_text_excerpt`]: joins each
+/// `TableCell`'s own plain-text preview with `" | "`, truncated to 80
+/// characters overall. Used for a `tr.anchor`'s `data-excerpt` — `events`
+/// is a row's sanitized inner event slice, same rationale as
+/// [`plain_text_excerpt`] for why this is built from sanitized content
+/// rather than raw Markdown (see [`row_excerpt`] for the raw-Markdown
+/// analogue used by [`anchors`]/export).
+fn plain_text_excerpt_row(events: &[Event<'_>]) -> String {
+    let mut cells: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < events.len() {
+        if matches!(events[i], Event::Start(Tag::TableCell)) {
+            let end = matching_end_index(events, i);
+            cells.push(plain_text_excerpt(&events[i + 1..end]));
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    let joined = cells.join(" | ");
+    joined.chars().take(80).collect()
+}
+
+/// Given `events[start_idx]` is a `Start`, returns the index of its
+/// matching `End` (tracking nested `Start`/`End` depth in between). Used to
+/// find a table cell's extent within an already-sanitized (range-less)
+/// event slice — see [`plain_text_excerpt_row`], [`render_row_cells`]. The
+/// ranged analogue, used while events still carry source byte ranges, is
+/// [`matching_end_index_ranged`].
+fn matching_end_index(events: &[Event<'_>], start_idx: usize) -> usize {
+    let mut depth = 1;
+    let mut j = start_idx + 1;
+    while depth > 0 {
+        match &events[j] {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => depth -= 1,
+            _ => {}
+        }
+        if depth > 0 {
+            j += 1;
+        }
+    }
+    j
+}
+
+/// The ranged-event analogue of [`matching_end_index`], used while events
+/// still carry their source byte ranges (before [`sanitize_events`] drops
+/// them) — see [`scan_anchor_span`], [`row_excerpt`], [`render_row_cells`].
+fn matching_end_index_ranged(events: &[(Event<'_>, Range<usize>)], start_idx: usize) -> usize {
+    let mut depth = 1;
+    let mut j = start_idx + 1;
+    while depth > 0 {
+        match &events[j].0 {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => depth -= 1,
+            _ => {}
+        }
+        if depth > 0 {
+            j += 1;
+        }
+    }
+    j
+}
+
+/// The item-anchor analogue of [`excerpt_of`]: the item's first source line
+/// with its list marker stripped (see [`strip_item_marker`]), truncated to
+/// 80 characters.
+fn item_excerpt(trimmed_source: &str) -> String {
+    let first_line = trimmed_source.lines().next().unwrap_or("");
+    strip_item_marker(first_line).chars().take(80).collect()
+}
+
+/// Strips a list item's marker from the start of `line`: a bullet (`- `,
+/// `* `, `+ `) or an ordered marker (one or more ASCII digits followed by
+/// `. ` or `) `), then — if present — a task-list checkbox (`[ ] `, `[x] `,
+/// `[X] `). Returns `line` (aside from leading-whitespace trimming)
+/// unchanged if it doesn't start with a recognized bullet/ordered marker.
+fn strip_item_marker(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    let after_bullet = ["- ", "* ", "+ "]
+        .iter()
+        .find_map(|marker| trimmed.strip_prefix(marker))
+        .unwrap_or_else(|| {
+            // Ordered marker: leading ASCII digits (always 1 byte each, so
+            // the char count doubles as the byte offset) then `. `/`) `.
+            let digit_count = trimmed.chars().take_while(char::is_ascii_digit).count();
+            if digit_count == 0 {
+                return trimmed;
+            }
+            let after_digits = &trimmed[digit_count..];
+            after_digits
+                .strip_prefix(". ")
+                .or_else(|| after_digits.strip_prefix(") "))
+                .unwrap_or(trimmed)
+        });
+    ["[ ] ", "[x] ", "[X] "]
+        .iter()
+        .find_map(|marker| after_bullet.strip_prefix(marker))
+        .unwrap_or(after_bullet)
+}
+
+/// The row-anchor analogue of [`excerpt_of`]: each `TableCell`'s raw
+/// (trimmed) Markdown text, joined with `" | "` and truncated to 80
+/// characters overall. `inner_events` is a row anchor's inner event slice
+/// (its `TableCell` children) with byte ranges still attached, as produced
+/// by [`parsed_blocks`]/consumed by [`scan_anchor_span`].
+fn row_excerpt(markdown: &str, inner_events: &[(Event<'_>, Range<usize>)]) -> String {
+    let mut cells: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < inner_events.len() {
+        if matches!(inner_events[i].0, Event::Start(Tag::TableCell)) {
+            let end = matching_end_index_ranged(inner_events, i);
+            let cell_range = inner_events[i].1.start..inner_events[end].1.end;
+            cells.push(markdown[cell_range].trim().to_string());
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    let joined = cells.join(" | ");
+    joined.chars().take(80).collect()
+}
+
+/// `event` is an `Item`/`TableHead`/`TableRow` `Start` — the three
+/// event kinds [`walk_anchors`]/[`render_events_html`] treat as anchor
+/// boundaries — or `None` for anything else (including a bare `TableCell`
+/// or `Table` boundary, neither of which is its own anchor kind).
+fn anchor_kind_of(event: &Event<'_>) -> Option<AnchorKind> {
+    match event {
+        Event::Start(Tag::Item) => Some(AnchorKind::Item),
+        Event::Start(Tag::TableHead) | Event::Start(Tag::TableRow) => Some(AnchorKind::Row),
+        _ => None,
+    }
+}
+
+/// Everything [`walk_anchors`] (for [`anchors`]) and [`render_events_html`]
+/// (for [`to_html`]) need once they've found an anchor-kind `Start`'s
+/// matching `End`: the computed hash/source/excerpt/line-range, plus
+/// `end_idx` so the caller knows where to resume scanning. Both callers
+/// build this the same way ([`scan_anchor_span`]), so `anchors()` and the
+/// `data-hash`/`data-line-start`/`data-line-end` attributes `to_html` emits
+/// can never disagree about a given item/row's identity.
+struct AnchorSpan {
+    kind: AnchorKind,
+    hash: String,
+    source: String,
+    excerpt: String,
+    line_start: usize,
+    line_end: usize,
+    end_idx: usize,
+}
+
+/// Given `events[start_idx]` is `Start(Tag::Item)`, `Start(Tag::TableHead)`,
+/// or `Start(Tag::TableRow)` (`kind` says which — see [`anchor_kind_of`]),
+/// finds its matching `End` and computes the resulting [`AnchorSpan`].
+fn scan_anchor_span(
+    markdown: &str,
+    events: &[(Event<'_>, Range<usize>)],
+    start_idx: usize,
+    kind: AnchorKind,
+) -> AnchorSpan {
+    let end_idx = matching_end_index_ranged(events, start_idx);
+    let full_range = events[start_idx].1.start..events[end_idx].1.end;
+    let (line_start, line_end) = line_range(markdown, &full_range);
+    let source = markdown[full_range].trim().to_string();
+    let hash = hash_source(&source);
+    let excerpt = match kind {
+        AnchorKind::Item => item_excerpt(&source),
+        AnchorKind::Row => row_excerpt(markdown, &events[start_idx + 1..end_idx]),
+        AnchorKind::Block => unreachable!("scan_anchor_span is only called for Item/Row starts"),
+    };
+    AnchorSpan {
+        kind,
+        hash,
+        source,
+        excerpt,
+        line_start,
+        line_end,
+        end_idx,
+    }
+}
+
+/// Recursion depth cap for [`walk_anchors`]/[`render_events_html`]: once
+/// nesting reaches this many levels, a further-nested `Item`/`TableHead`/
+/// `TableRow` is no longer treated as its own anchor — [`anchors`] stops
+/// including it (and everything inside it), and `to_html` renders it (and
+/// everything inside it) as ordinary leaf content via `push_html` instead
+/// of a hand-written `<li>`/`<tr>`. `push_html` itself never recurses on
+/// nesting depth at all (it's a flat iterator loop, however deep a list
+/// actually goes), so this cap exists only to bound *our own* recursion,
+/// not pulldown-cmark's — ordinary documents never come close to it, but a
+/// pathological or malicious input (thousands of nested list items)
+/// shouldn't be able to blow the stack via `walk_anchors`/
+/// `render_events_html` either.
+const MAX_ANCHOR_DEPTH: u32 = 64;
+
+/// Recursively finds every `Item`/`TableHead`/`TableRow` anchor within
+/// `events` (a block's, or an already-found anchor's inner, event slice),
+/// appending each to `anchors` in document order with `parent` pointing
+/// back at `parent_idx`, then recursing into its own inner events (at
+/// `depth + 1`) with the new anchor as the parent — so a nested list item's
+/// parent is its immediately enclosing item, not the top-level block
+/// (nesting is transparent through non-anchor wrappers like `BlockQuote`/
+/// `List`/`Table`). `depth` starts at 0
+/// for a top-level block's own direct children; once it reaches
+/// [`MAX_ANCHOR_DEPTH`] this returns immediately without scanning `events`
+/// at all, so nothing at or beyond that depth becomes an anchor.
+fn walk_anchors(
+    markdown: &str,
+    events: &[(Event<'_>, Range<usize>)],
+    parent_idx: usize,
+    depth: u32,
+    anchors: &mut Vec<Anchor>,
+) {
+    if depth >= MAX_ANCHOR_DEPTH {
+        return;
+    }
+    let mut i = 0;
+    while i < events.len() {
+        let Some(kind) = anchor_kind_of(&events[i].0) else {
+            i += 1;
+            continue;
+        };
+        let span = scan_anchor_span(markdown, events, i, kind);
+        let idx = anchors.len();
+        anchors.push(Anchor {
+            kind: span.kind,
+            hash: span.hash,
+            source: span.source,
+            excerpt: span.excerpt,
+            line_start: span.line_start,
+            line_end: span.line_end,
+            parent: Some(parent_idx),
+        });
+        walk_anchors(
+            markdown,
+            &events[i + 1..span.end_idx],
+            idx,
+            depth + 1,
+            anchors,
+        );
+        i = span.end_idx + 1;
+    }
+}
+
+/// Every review-comment anchor in `markdown`, in document order: each
+/// top-level block ([`Block`]/[`blocks`]'s granularity), immediately
+/// followed by its nested list items and table rows (any depth, in
+/// document order), before moving on to the next block.
+///
+/// [`blocks`] is a thin filter over this: `anchors(markdown)` restricted to
+/// `kind == AnchorKind::Block`.
+pub fn anchors(markdown: &str) -> Vec<Anchor> {
+    let mut anchors = Vec::new();
+    for (range, events) in parsed_blocks(markdown) {
+        let (line_start, line_end) = line_range(markdown, &range);
+        let source = markdown[range].trim().to_string();
+        let hash = hash_source(&source);
+        let excerpt = excerpt_of(&source);
+        let idx = anchors.len();
+        anchors.push(Anchor {
+            kind: AnchorKind::Block,
+            hash,
+            source,
+            excerpt,
+            line_start,
+            line_end,
+            parent: None,
+        });
+        walk_anchors(markdown, &events, idx, 0, &mut anchors);
+    }
+    anchors
+}
+
+/// Splits `markdown` into its top-level blocks, in document order — the
+/// `kind == AnchorKind::Block` subset of [`anchors`], kept as its own
+/// narrower type since most callers (review.rs's export, mainly) only ever
+/// dealt with block-level granularity before nested item/row anchors
+/// existed. `blocks(markdown).len()` and the number of `.blk` divs
+/// `to_html` produces always match, in the same order with the same
+/// hashes.
+pub fn blocks(markdown: &str) -> Vec<Block> {
+    anchors(markdown)
+        .into_iter()
+        .filter(|a| a.kind == AnchorKind::Block)
+        .map(|a| Block {
+            hash: a.hash,
+            source: a.source,
+            excerpt: a.excerpt,
+            line_start: a.line_start,
+            line_end: a.line_end,
+        })
+        .collect()
+}
+
+/// One non-blank line of a plain-text document, trimmed, plus the
+/// derived fields [`to_html_plain`] and [`anchors_plain`] both need — see
+/// [`plain_lines`].
+struct PlainLine {
+    /// See [`Block::hash`]/[`hash_source`], computed from `source`.
+    hash: String,
+    /// The line, trimmed of leading/trailing whitespace.
+    source: String,
+    /// See [`plain_line_excerpt`], computed from `source`.
+    excerpt: String,
+}
+
+/// Walks `text` line by line (`str::lines`, so a CRLF file's `\r` never
+/// survives the split), yielding `(1-based line number, raw line,
+/// Some(PlainLine) | None)` for every line in document order. The third
+/// element is `None` for a blank or whitespace-only line (which still gets
+/// a line number, advancing the count) and `Some` — built from the
+/// *trimmed* line's hash/source/excerpt — for every other line.
+///
+/// This is the single place the "trim, check blank, hash, excerpt" walk is
+/// written: [`to_html_plain`] and [`anchors_plain`] both consume it rather
+/// than re-implementing it, which is what makes it impossible for the two
+/// to disagree on which lines get an anchor or what a given line's
+/// hash/excerpt is.
+fn plain_lines(text: &str) -> impl Iterator<Item = (usize, &str, Option<PlainLine>)> {
+    text.lines().enumerate().map(|(index, line)| {
+        let trimmed = line.trim();
+        let plain = if trimmed.is_empty() {
+            None
+        } else {
+            Some(PlainLine {
+                hash: hash_source(trimmed),
+                source: trimmed.to_string(),
+                excerpt: plain_line_excerpt(trimmed),
+            })
+        };
+        (index + 1, line, plain)
+    })
+}
+
+/// The plain-text analogue of [`to_html`]: renders `text` verbatim, with
+/// no Markdown parsing at all (`# x` stays `# x`, `<script>` becomes
+/// escaped, inert text), for a document opened as
+/// [`FileKind::PlainText`](crate::util::FileKind).
+///
+/// Every non-blank line becomes its own review anchor, wrapped in exactly
+/// the same `<div class="blk" data-kind="block" data-hash="..."
+/// data-line-start="..." data-line-end="..." data-excerpt="...">` markup
+/// [`to_html`] gives a top-level Markdown block — that is what lets
+/// `assets/review.js` drive line-level comments with no changes of its
+/// own. A blank line becomes `<div class="blk-blank"></div>`, which
+/// deliberately does *not* carry the `blk` class, so it is neither
+/// clickable nor counted by review.js's `querySelectorAll(".blk")`.
+///
+/// The whole fragment is wrapped in `<div class="plain">`, which
+/// `assets/style.css` hangs `white-space: pre-wrap` / a monospace font /
+/// `tab-size` off (unscoped, so `--export`'s standalone page — which has
+/// no `.doc` class — formats the same way the live view does).
+///
+/// `hash`/`data-excerpt` are computed from the *trimmed* line (see
+/// [`anchors_plain`], which must agree with this function line for line —
+/// both are built on the shared [`plain_lines`] walk), while the rendered
+/// body keeps the raw line so indentation and tabs survive. Line splitting
+/// is `str::lines`, so a CRLF file's `\r` never reaches the output or the
+/// hash.
+///
+/// One exception to "verbatim": a whitespace-only line is folded into the
+/// same blank-line `<div class="blk-blank">` as a truly empty line (see
+/// [`plain_lines`]), so its whitespace is not part of the output — only a
+/// non-blank line's leading/trailing whitespace survives.
+pub fn to_html_plain(text: &str) -> String {
+    let mut out = String::from("<div class=\"plain\">\n");
+    for (line_number, line, plain) in plain_lines(text) {
+        let Some(PlainLine { hash, excerpt, .. }) = plain else {
+            out.push_str("<div class=\"blk-blank\"></div>\n");
+            continue;
+        };
+        let line_number = line_number.to_string();
+        out.push_str("<div class=\"blk\" data-kind=\"block\" data-hash=\"");
+        out.push_str(&hash);
+        out.push_str("\" data-line-start=\"");
+        out.push_str(&line_number);
+        out.push_str("\" data-line-end=\"");
+        out.push_str(&line_number);
+        out.push_str("\" data-excerpt=\"");
+        out.push_str(&escape_html_text(&excerpt));
+        out.push_str("\">");
+        out.push_str(&escape_html_text(line));
+        out.push_str("</div>\n");
+    }
+    out.push_str("</div>\n");
+    out
+}
+
+/// The plain-text analogue of [`anchors`]: one [`AnchorKind::Block`]
+/// anchor per non-blank line of `text`, in document order. Blank lines
+/// produce no anchor at all (but still advance the line counter), and
+/// `parent` is always `None` — plain text has no nesting, so there are
+/// never `Item`/`Row` anchors to parent anything to.
+///
+/// The hashes/excerpts this returns match, one for one and in order, the
+/// `data-hash`/`data-excerpt` attributes [`to_html_plain`] emits for the
+/// same input — the same invariant [`blocks`] and [`to_html`] hold for
+/// Markdown, and what makes a saved comment re-anchor across reloads. Both
+/// functions are built on the shared [`plain_lines`] walk, so this holds
+/// by construction rather than by keeping two copies in sync by hand.
+pub fn anchors_plain(text: &str) -> Vec<Anchor> {
+    plain_lines(text)
+        .filter_map(|(line_number, _line, plain)| {
+            plain.map(
+                |PlainLine {
+                     hash,
+                     source,
+                     excerpt,
+                 }| Anchor {
+                    kind: AnchorKind::Block,
+                    hash,
+                    source,
+                    excerpt,
+                    line_start: line_number,
+                    line_end: line_number,
+                    parent: None,
+                },
+            )
+        })
+        .collect()
+}
+
+/// A plain-text line's excerpt: its first 80 *characters* (not bytes, so
+/// a multi-byte character is never split), from the already-trimmed line.
+///
+/// Deliberately not [`excerpt_of`]: that one skips a leading code-fence
+/// line in favor of the next line, which is a Markdown-specific rule —
+/// applied here it would give a line that merely starts with ``` an empty
+/// excerpt. Used by [`plain_lines`], which both [`to_html_plain`] and
+/// [`anchors_plain`] consume, so the two can never disagree.
+fn plain_line_excerpt(trimmed_line: &str) -> String {
+    trimmed_line.chars().take(80).collect()
+}
+
+/// Computes a block's 1-based `(line_start, line_end)` within `markdown`,
+/// given its (untrimmed) byte `range` as reported by
+/// [`Parser::into_offset_iter`]. `line_start` counts the `\n` characters
+/// before `range.start`, plus one. `line_end` counts the `\n` characters
+/// before the position where the block's source ends *after trimming only
+/// trailing whitespace* (so a block's own trailing blank lines inside
+/// `range` — which [`parsed_blocks`] doesn't otherwise strip — never
+/// inflate the reported end line), plus one.
+///
+/// Counting raw `\n` bytes rather than reasoning about line contents means
+/// this gives the same, correct answer whether `markdown` uses `\n` or
+/// `\r\n` line endings: a `\r\n` pair still contributes exactly one `\n`
+/// per line.
+fn line_range(markdown: &str, range: &Range<usize>) -> (usize, usize) {
+    let line_start = count_newlines_before(markdown, range.start) + 1;
+    let trimmed_end = range.start + markdown[range.clone()].trim_end().len();
+    let line_end = count_newlines_before(markdown, trimmed_end) + 1;
+    (line_start, line_end)
+}
+
+fn count_newlines_before(markdown: &str, byte_pos: usize) -> usize {
+    markdown[..byte_pos].bytes().filter(|&b| b == b'\n').count()
+}
+
+/// Returns the byte length of a YAML frontmatter block at the very start of
+/// `markdown`, or `0` if there is none.
+///
+/// A leading UTF-8 BOM (`\u{FEFF}`), if present, is skipped before looking
+/// for the opening `---` — editors on Windows routinely write one — but its
+/// byte length is folded into the returned offset, since it's part of the
+/// frontmatter block that callers strip from the body.
+///
+/// The rule mirrors what Jekyll/Obsidian/most static-site generators treat
+/// as frontmatter: the *first line of the file* (no leading blank line
+/// allowed — a document that merely happens to open a `---`-delimited
+/// section a line or two in is not frontmatter) must be `---` once
+/// trailing whitespace (`\r`, spaces, tabs — anything `str::trim_end`
+/// strips) is removed. The block then runs until the first following line
+/// that is, by the same trailing-whitespace-tolerant comparison, `---` or
+/// `...` (frontmatter's YAML-standard "end of document" marker, also
+/// accepted by Jekyll/Obsidian). Tolerating trailing whitespace on the
+/// delimiter lines matches Jekyll/goldmark/remark-frontmatter, which all
+/// accept a trailing space or tab there. If no such closing line exists,
+/// this isn't frontmatter after all — `0` is returned and the text is left
+/// to render as normal Markdown (so the opening `---` falls back to being
+/// a horizontal rule/setext heading, whatever pulldown-cmark would
+/// otherwise make of it).
+///
+/// The returned length includes the closing line's own trailing newline
+/// (`\n`, plus the `\r` right before it if present), so callers can slice
+/// `&markdown[frontmatter_len(markdown)..]` to get exactly the document
+/// body with no leading blank line. A closing line at the very end of the
+/// file with no trailing newline is included up to the end of the file.
+///
+/// This never looks past the first closing line, so a `---` appearing
+/// later in the document body (e.g. as a horizontal rule) is untouched —
+/// it's not part of what this function scans. Every byte offset this
+/// returns is measured against the *original* `markdown`, so callers that
+/// use it to shift other offsets (see [`parsed_blocks`]) keep line numbers
+/// anchored to the original file.
+///
+/// Trade-off: because only the first line is checked, a non-frontmatter
+/// document that happens to open with a horizontal rule (`---`) followed
+/// later by another `---`/`...` line has that whole span swallowed and
+/// left unrendered. This is the same rule Jekyll and Obsidian apply, so it
+/// was adopted deliberately rather than accepted as an edge case.
+fn frontmatter_len(markdown: &str) -> usize {
+    let bom_len = markdown.len() - markdown.strip_prefix('\u{FEFF}').unwrap_or(markdown).len();
+    let body = &markdown[bom_len..];
+
+    let mut lines = body.split_inclusive('\n');
+
+    let Some(first_line) = lines.next() else {
+        return 0;
+    };
+    if first_line.trim_end() != "---" {
+        return 0;
+    }
+
+    let mut offset = first_line.len();
+    for line in lines {
+        let trimmed = line.trim_end();
+        offset += line.len();
+        if trimmed == "---" || trimmed == "..." {
+            return bom_len + offset;
+        }
+    }
+
+    0
+}
+
+fn markdown_options() -> Options {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options
+}
+
+/// One event paired with its source byte range, as reported by
+/// [`Parser::into_offset_iter`]. [`parsed_blocks`] returns a block's whole
+/// event slice in this form so [`walk_anchors`]/[`render_events_html`] can
+/// locate a nested item/row's extent without re-parsing.
+type RangedEvent<'a> = (Event<'a>, Range<usize>);
+
+/// Parses `markdown` and groups its events into top-level blocks: each
+/// entry is the block's byte range in `markdown` (untrimmed) paired with
+/// its owned [`RangedEvent`] slice.
+///
+/// A block is either a `Start`/`End` pair at nesting depth 0 (covering
+/// every event in between, however deeply nested — a whole list, table,
+/// blockquote, etc. is one block) or, at depth 0, a single event that is
+/// neither `Start` nor `End` (e.g. `Event::Rule`, or a stray depth-0
+/// `Event::Html`).
+///
+/// Any [`frontmatter_len`] prefix is stripped before parsing — the parser
+/// never sees it, so it never becomes a block — and every byte range this
+/// returns (both the block's own range and its events') is shifted back by
+/// that same length before returning, so callers keep working against
+/// offsets (and, via [`line_range`], line numbers) in the *original*
+/// `markdown`, frontmatter included.
+fn parsed_blocks(markdown: &str) -> Vec<(Range<usize>, Vec<RangedEvent<'_>>)> {
+    let body_start = frontmatter_len(markdown);
+    let events: Vec<(Event<'_>, Range<usize>)> =
+        Parser::new_ext(&markdown[body_start..], markdown_options())
+            .into_offset_iter()
+            .map(|(event, range)| (event, range.start + body_start..range.end + body_start))
+            .collect();
+
+    let mut result = Vec::new();
+    let mut depth: i32 = 0;
+    let mut block_start_idx: Option<usize> = None;
+
+    for (i, (event, _)) in events.iter().enumerate() {
+        match event {
+            Event::Start(_) => {
+                if depth == 0 {
+                    block_start_idx = Some(i);
+                }
+                depth += 1;
+            }
+            Event::End(_) => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start) = block_start_idx.take() {
+                        result.push((start, i));
+                    }
+                }
+            }
+            _ => {
+                if depth == 0 {
+                    result.push((i, i));
+                }
+            }
+        }
+    }
+
+    result
+        .into_iter()
+        .map(|(start, end)| {
+            let range = events[start].1.start..events[end].1.end;
+            let block_events: Vec<(Event<'_>, Range<usize>)> = events[start..=end].to_vec();
+            (range, block_events)
+        })
+        .collect()
+}
+
+/// Renders `events` (a block's, or an anchor's inner, event slice) as HTML
+/// into `out`, wrapping every nested `Item`/`TableHead`/`TableRow` in its
+/// own anchor tag (`<li>`/`<tr>`, via [`push_anchor_open`]) — see
+/// [`to_html`]. Everything else, including a bare `Table`/`TableCell`
+/// boundary (neither is itself an anchor), is rendered in maximal
+/// contiguous runs ("leaf runs") through the ordinary [`sanitize_events`] +
+/// `html::push_html` pipeline — see [`flush_leaf`] for what a fresh
+/// `push_html` call per run does and doesn't change about the output.
+///
+/// `alignments` seeds a small stack of per-table column alignments: pushed
+/// on every `Start(Tag::Table(a))` this function's own scan encounters
+/// (`a.clone()`) and popped on the matching `End(TagEnd::Table)`, so a
+/// row's cells (rendered by [`render_row_cells`], which needs the *current*
+/// table's alignments) know the right styling regardless of how deep the
+/// table is nested — inside a blockquote, a list item, a footnote
+/// definition, even (in principle) another table's cell content. A stack
+/// rather than a single `Option` because a recursive call for a nested
+/// `Item` starts from whatever alignment state was already current at that
+/// point (the parameter), and that same call's own scan may then push
+/// further table(s) found inside the item on top of it. This state has to
+/// be tracked by hand at all, rather than just letting a fresh `push_html`
+/// call recover it from the `Start(Tag::Table(_))` event itself, because a
+/// row's cells are rendered via a *separate* `push_html` call from the
+/// table's own opening tag (see [`flush_leaf`]) — each such call resets
+/// pulldown-cmark's internal head/body and column-alignment tracking, so
+/// nothing inside a single fresh call can see a table's alignments unless
+/// this function hands them over explicitly.
+///
+/// `depth` is 0 for a block's own direct children, incrementing by one for
+/// every `Item` anchor recursed into; once it reaches [`MAX_ANCHOR_DEPTH`],
+/// a further-nested `Item`/`TableHead`/`TableRow` is no longer treated as
+/// an anchor at all — it (and everything inside it) becomes ordinary leaf
+/// content, rendered by `push_html` like any other run.
+fn render_events_html(
+    markdown: &str,
+    events: &[(Event<'_>, Range<usize>)],
+    alignments: Option<&[Alignment]>,
+    depth: u32,
+    rewrite_local_images: bool,
+    out: &mut String,
+) {
+    let mut alignment_stack: Vec<Vec<Alignment>> = match alignments {
+        Some(a) => vec![a.to_vec()],
+        None => Vec::new(),
+    };
+    let mut i = 0;
+    let mut leaf_start = 0;
+    while i < events.len() {
+        match &events[i].0 {
+            Event::Start(Tag::Table(table_alignments)) => {
+                alignment_stack.push(table_alignments.clone());
+                i += 1;
+                continue;
+            }
+            Event::End(TagEnd::Table) => {
+                alignment_stack.pop();
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        let kind = if depth < MAX_ANCHOR_DEPTH {
+            anchor_kind_of(&events[i].0)
+        } else {
+            None
+        };
+        let Some(kind) = kind else {
+            i += 1;
+            continue;
+        };
+        flush_leaf(events, leaf_start, i, rewrite_local_images, out);
+
+        let span = scan_anchor_span(markdown, events, i, kind);
+        let inner = &events[i + 1..span.end_idx];
+        // `false`: same reasoning as the excerpt pass in `to_html` — an
+        // image's `dest_url` is never part of `Text`/`Code` content, so it
+        // can't affect `data_excerpt` either way.
+        let inner_sanitized =
+            sanitize_events(inner.iter().map(|(e, _)| e.clone()).collect(), false);
+        let data_excerpt = match kind {
+            AnchorKind::Item => plain_text_excerpt(&inner_sanitized),
+            AnchorKind::Row => plain_text_excerpt_row(&inner_sanitized),
+            AnchorKind::Block => unreachable!("anchor_kind_of never returns Block"),
+        };
+        let is_head = matches!(events[i].0, Event::Start(Tag::TableHead));
+        let current_alignments = alignment_stack.last().map(Vec::as_slice);
+
+        match kind {
+            AnchorKind::Item => {
+                push_anchor_open(out, "li", "item", &span, &data_excerpt);
+                render_events_html(
+                    markdown,
+                    inner,
+                    current_alignments,
+                    depth + 1,
+                    rewrite_local_images,
+                    out,
+                );
+                out.push_str("</li>\n");
+            }
+            AnchorKind::Row => {
+                if is_head {
+                    out.push_str("<thead>");
+                }
+                push_anchor_open(out, "tr", "row", &span, &data_excerpt);
+                render_row_cells(
+                    inner,
+                    current_alignments,
+                    is_head,
+                    rewrite_local_images,
+                    out,
+                );
+                out.push_str("</tr>\n");
+                if is_head {
+                    out.push_str("</thead><tbody>\n");
+                }
+            }
+            AnchorKind::Block => unreachable!("anchor_kind_of never returns Block"),
+        }
+
+        i = span.end_idx + 1;
+        leaf_start = i;
+    }
+    flush_leaf(events, leaf_start, events.len(), rewrite_local_images, out);
+}
+
+/// Sanitizes and renders `events[start..end]` (a maximal run of events
+/// containing no anchor-kind `Start` — see [`anchor_kind_of`]) via a single
+/// fresh `push_html` call. A no-op if the run is empty (one anchor
+/// immediately follows another, or the slice starts/ends right at one).
+///
+/// A fresh `push_html` call per run — rather than one call over the whole
+/// block, as before nested anchors existed — means pulldown-cmark's
+/// internal `end_newline` tracking (whether the last thing written ended in
+/// `\n`) resets to `true` at the start of each run instead of carrying over
+/// from whatever was written just before (e.g. a hand-written `<li>`, which
+/// has no trailing newline). The only consequence is a possible
+/// extra/missing blank line in the *raw HTML* right at such a boundary
+/// (e.g. before a loose list item's `<p>`) — invisible in the rendered
+/// page, since whitespace between block-level tags has no visual effect.
+/// Nothing here depends on tight-vs-loose list paragraph suppression:
+/// pulldown-cmark decides that at parse time (a tight list's items simply
+/// never contain `Paragraph` events in the first place), not in
+/// `html::push_html`, so that distinction is unaffected by how many pieces
+/// the event stream ends up rendered in.
+fn flush_leaf(
+    events: &[(Event<'_>, Range<usize>)],
+    start: usize,
+    end: usize,
+    rewrite_local_images: bool,
+    out: &mut String,
+) {
+    if start == end {
+        return;
+    }
+    let slice: Vec<Event<'_>> = events[start..end].iter().map(|(e, _)| e.clone()).collect();
+    let sanitized = sanitize_events(slice, rewrite_local_images);
+    html::push_html(out, sanitized.into_iter());
+}
+
+/// Renders a row's `TableCell` children as `<th>`/`<td>` (`is_head` picks
+/// which), each with the same column text-align inline style
+/// pulldown-cmark's own `html::push_html` would emit (from `alignments`,
+/// indexed by cell position) — replicated by hand here since it depends on
+/// state (head-vs-body, per-column alignment) that a fresh per-run
+/// `push_html` call (see [`flush_leaf`]) can't carry across the row-anchor
+/// boundary. Each cell's own inner content is inline-only — no block-level
+/// Markdown construct can appear inside a table cell — so *that* part is
+/// safe to sanitize/render with an ordinary fresh `push_html` call; nothing
+/// inline depends on the state above.
+fn render_row_cells(
+    events: &[(Event<'_>, Range<usize>)],
+    alignments: Option<&[Alignment]>,
+    is_head: bool,
+    rewrite_local_images: bool,
+    out: &mut String,
+) {
+    let tag = if is_head { "th" } else { "td" };
+    let mut column = 0usize;
+    let mut i = 0;
+    while i < events.len() {
+        if !matches!(events[i].0, Event::Start(Tag::TableCell)) {
+            i += 1;
+            continue;
+        }
+        let end = matching_end_index_ranged(events, i);
+
+        out.push('<');
+        out.push_str(tag);
+        match alignments.and_then(|a| a.get(column)) {
+            Some(Alignment::Left) => out.push_str(" style=\"text-align: left\">"),
+            Some(Alignment::Center) => out.push_str(" style=\"text-align: center\">"),
+            Some(Alignment::Right) => out.push_str(" style=\"text-align: right\">"),
+            _ => out.push('>'),
+        }
+        let inner: Vec<Event<'_>> = events[i + 1..end].iter().map(|(e, _)| e.clone()).collect();
+        html::push_html(
+            out,
+            sanitize_events(inner, rewrite_local_images).into_iter(),
+        );
+        out.push_str("</");
+        out.push_str(tag);
+        out.push('>');
+
+        column += 1;
+        i = end + 1;
+    }
+}
+
+/// Writes an anchor's opening tag: `<{tag} class="anchor"
+/// data-kind="{kind_name}" data-hash="..." data-line-start="..."
+/// data-line-end="..." data-excerpt="...">`. `excerpt` is HTML-escaped;
+/// everything else in `span` is already a hex hash or a decimal line
+/// number, so none of it needs escaping.
+fn push_anchor_open(
+    out: &mut String,
+    tag: &str,
+    kind_name: &str,
+    span: &AnchorSpan,
+    excerpt: &str,
+) {
+    out.push('<');
+    out.push_str(tag);
+    out.push_str(" class=\"anchor\" data-kind=\"");
+    out.push_str(kind_name);
+    out.push_str("\" data-hash=\"");
+    out.push_str(&span.hash);
+    out.push_str("\" data-line-start=\"");
+    out.push_str(&span.line_start.to_string());
+    out.push_str("\" data-line-end=\"");
+    out.push_str(&span.line_end.to_string());
+    out.push_str("\" data-excerpt=\"");
+    out.push_str(&escape_html_text(excerpt));
+    out.push_str("\">");
+}
+
+/// `sha256(trim(source))`'s first 16 hex characters. `source` is expected
+/// to already be trimmed (both [`blocks`] and [`to_html`] trim before
+/// calling this), so this never trims itself — it just hex-encodes.
+fn hash_source(source: &str) -> String {
+    let digest = Sha256::digest(source.as_bytes());
+    let mut hex = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
+/// The block's first line, truncated to 80 *characters* (not bytes, so a
+/// multi-byte UTF-8 character is never split). If the first line is a code
+/// fence (```` ``` ```` or `~~~`, possibly indented), the fence line is
+/// skipped in favor of the next line — the first line of actual code
+/// content — since the fence itself isn't useful as an excerpt.
+fn excerpt_of(trimmed_source: &str) -> String {
+    let mut lines = trimmed_source.lines();
+    let first = lines.next().unwrap_or("");
+    let excerpt_line = if is_code_fence_line(first) {
+        lines.next().unwrap_or("")
+    } else {
+        first
+    };
+    excerpt_line.chars().take(80).collect()
+}
+
+fn is_code_fence_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+/// Rewrites a full parse event stream so it's safe to hand to
+/// `pulldown_cmark::html::push_html` unchanged. Two kinds of event are
+/// touched:
+///
+/// - Raw HTML (`Html`/`InlineHtml`): pulldown-cmark passes it through
+///   verbatim, which would let e.g. a `<script>` block in the source
+///   execute in the browser. Its text is run through
+///   [`strip_html_comments`] and then re-emitted as a `Text` event, so it
+///   goes through the same HTML-escaping path as any other text and
+///   renders as literal, inert text — with any `<!--...-->` ranges removed
+///   rather than shown.
+///
+///   Block-level raw HTML needs special handling here: pulldown-cmark
+///   splits an HTML block into one `Html` event per source line (and, after
+///   CRLF normalization, sometimes more than one event per line), all
+///   between a `Start(Tag::HtmlBlock)`/`End(TagEnd::HtmlBlock)` pair. A
+///   multi-line comment like `<!--\nsecret\n-->` therefore arrives as three
+///   separate `Html` events, and a line like `<!-- c --> visible` arrives
+///   as a single event containing both the comment and real content. Either
+///   per-event line-splitting or a bare "does this event start with
+///   `<!--`" check gets one of those wrong, so instead every `Html` event
+///   inside a block is buffered and only stripped/emitted as one `Text`
+///   event once the block ends. `InlineHtml` doesn't need this: each event
+///   is already exactly one self-contained raw-HTML unit (a tag or a
+///   complete comment), never mixed with surrounding content.
+/// - Link/image destinations (`Start(Tag::Link { .. })` /
+///   `Start(Tag::Image { .. })`): Markdown lets a link or image point at
+///   any URL scheme, including `javascript:` and `data:`, both of which are
+///   executable/renderable in ways that amount to script injection.
+///   [`sanitize_link_target`] replaces anything that isn't on a small
+///   allowlist with `#`.
+///
+///   When `rewrite_local_images` is `true`, an *image* target (never a
+///   link — [`GET /asset`](crate::routes) only ever needs to serve
+///   `<img>` sources) that survives that allowlist and is itself a
+///   relative, scheme-less, non-fragment, non-rooted reference is further
+///   rewritten by [`rewrite_local_image_target`] to
+///   `/asset?p=<percent-encoded path>`, so the live view can request it
+///   from the running server instead of the (nonexistent, in a browser)
+///   local filesystem.
+fn sanitize_events(events: Vec<Event<'_>>, rewrite_local_images: bool) -> Vec<Event<'_>> {
+    let mut output = Vec::with_capacity(events.len());
+    // While `Some`, we're between a `Start(Tag::HtmlBlock)` and its
+    // matching `End`, accumulating every `Html` event's text so the whole
+    // block can be desanitized as one unit instead of line by line.
+    let mut html_block_buffer: Option<String> = None;
+
+    for event in events {
+        match event {
+            Event::Start(Tag::HtmlBlock) => {
+                html_block_buffer = Some(String::new());
+                output.push(Event::Start(Tag::HtmlBlock));
+            }
+            Event::End(TagEnd::HtmlBlock) => {
+                if let Some(buffer) = html_block_buffer.take() {
+                    push_sanitized_raw_html(&mut output, &buffer);
+                }
+                output.push(Event::End(TagEnd::HtmlBlock));
+            }
+            Event::Html(text) => match html_block_buffer.as_mut() {
+                Some(buffer) => buffer.push_str(&text),
+                // Shouldn't happen in practice — pulldown-cmark only emits
+                // `Html` events inside a `HtmlBlock` — but handle it the
+                // same way as a one-line block just in case.
+                None => push_sanitized_raw_html(&mut output, &text),
+            },
+            Event::InlineHtml(text) => push_sanitized_raw_html(&mut output, &text),
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                title,
+                id,
+            }) => output.push(Event::Start(Tag::Link {
+                link_type,
+                dest_url: sanitize_link_target(dest_url),
+                title,
+                id,
+            })),
+            Event::Start(Tag::Image {
+                link_type,
+                dest_url,
+                title,
+                id,
+            }) => {
+                let dest_url = sanitize_link_target(dest_url);
+                let dest_url = if rewrite_local_images {
+                    rewrite_local_image_target(dest_url)
+                } else {
+                    dest_url
+                };
+                output.push(Event::Start(Tag::Image {
+                    link_type,
+                    dest_url,
+                    title,
+                    id,
+                }));
+            }
+            other => output.push(other),
+        }
+    }
+
+    output
+}
+
+/// Strips HTML comments out of `text` (see [`strip_html_comments`]) and, if
+/// anything other than whitespace remains, pushes it as a single `Text`
+/// event. If nothing but whitespace remains — the raw HTML was nothing but
+/// a comment — pushes nothing at all, rather than a stray blank text node.
+fn push_sanitized_raw_html<'a>(output: &mut Vec<Event<'a>>, text: &str) {
+    let stripped = strip_html_comments(text);
+    if stripped.trim().is_empty() {
+        return;
+    }
+    output.push(Event::Text(CowStr::from(stripped)));
+}
+
+/// Removes every `<!--...-->` range from `text`, leaving everything else —
+/// including real tags on the same line as a comment — untouched. An
+/// unterminated `<!--` (no matching `-->` anywhere in `text`) consumes the
+/// rest of `text`, since there's nothing meaningful to keep after a comment
+/// that never closes within the content we were given.
+fn strip_html_comments(text: &str) -> String {
+    const OPEN: &str = "<!--";
+    const CLOSE: &str = "-->";
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        match rest.find(OPEN) {
+            None => {
+                out.push_str(rest);
+                break;
+            }
+            Some(start) => {
+                out.push_str(&rest[..start]);
+                let after_open = &rest[start + OPEN.len()..];
+                match after_open.find(CLOSE) {
+                    Some(end) => rest = &after_open[end + CLOSE.len()..],
+                    None => break,
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Replaces `dest_url` with `#` unless [`is_safe_link_target`] accepts it,
+/// in which case surrounding whitespace is trimmed off before it's kept.
+/// Angle-bracket destinations (`< https://example.com >`) preserve that
+/// whitespace verbatim in `dest_url`; left untrimmed, it would reach
+/// `escape_href` and come out percent-encoded (`%20`) instead of just
+/// disappearing the way it visually looks like it should.
+fn sanitize_link_target(dest_url: CowStr<'_>) -> CowStr<'_> {
+    if !is_safe_link_target(&dest_url) {
+        return CowStr::from("#");
+    }
+    let trimmed = dest_url.trim();
+    if trimmed.len() == dest_url.len() {
+        // Nothing to trim — keep the original (often a zero-copy borrow)
+        // instead of reallocating.
+        dest_url
+    } else {
+        CowStr::from(trimmed.to_owned())
+    }
+}
+
+/// A link/image target is safe to keep as-is if it's a same-page fragment
+/// (`#...`), a relative reference with no URL scheme at all, or uses one of
+/// a small allowlist of schemes (`http`, `https`, `mailto`). Everything
+/// else is rejected — `javascript:`, `data:`, `vbscript:`, `file:`, etc.,
+/// and also protocol-relative references (`//evil.example`), which inherit
+/// whatever scheme the page is loaded over and so are just as capable of
+/// pointing at an attacker-controlled host as a fully-qualified URL.
+fn is_safe_link_target(dest_url: &str) -> bool {
+    let trimmed = dest_url.trim();
+    if trimmed.starts_with('#') {
+        return true;
+    }
+    if trimmed.starts_with("//") {
+        return false;
+    }
+    match trimmed.find(':') {
+        // No colon at all: a relative path, not an absolute URL.
+        None => true,
+        Some(colon_idx) => {
+            let before_colon = &trimmed[..colon_idx];
+            if before_colon.contains(['/', '?', '#']) {
+                // A `/`, `?`, or `#` before the first `:` means it isn't
+                // introducing a URI scheme (e.g. `a/b:c`, `./x?y:z`) — it's
+                // a relative reference that happens to contain a colon.
+                return true;
+            }
+            matches!(
+                before_colon.to_ascii_lowercase().as_str(),
+                "http" | "https" | "mailto"
+            )
+        }
+    }
+}
+
+/// Whether an already-[`sanitize_link_target`]-approved image `dest_url` is
+/// a *local relative* reference — the kind [`rewrite_local_image_target`]
+/// rewrites to `/asset?p=...` so the live view can serve it from disk next
+/// to the open document. `false` for a same-page fragment (`#...`), a
+/// protocol-relative (`//...`) or root-relative (`/...`) reference — both
+/// caught by the same `starts_with('/')` check — anything carrying a URL
+/// scheme (`http:`, `https:`, `mailto:`, the only schemes that can reach
+/// here at all; [`is_safe_link_target`] already rejected everything else),
+/// or anything with a `..` path segment anywhere in it (leading, like
+/// `../a.png`, or mid-path, like `a/../b.png`): those name a location
+/// *outside* the directory `routes::handle_asset` is willing to serve from,
+/// so rewriting them would only produce a `/asset` request guaranteed to
+/// come back `400` — better to leave the target alone. Left as a bare
+/// relative reference, the browser resolves it against the current page's
+/// own origin, so the CSP's `img-src 'self'` does *not* block the request
+/// (it's same-origin) — what actually stops the file from loading is that
+/// the resolved path is neither `/asset` nor any other route this app
+/// serves, so `routes::handle` answers `404` and nothing is read. None of
+/// these name a file next to the Markdown document on this machine.
+fn is_local_relative_image_target(dest_url: &str) -> bool {
+    if dest_url.starts_with('#') || dest_url.starts_with('/') {
+        return false;
+    }
+    if dest_url.split('/').any(|segment| segment == "..") {
+        return false;
+    }
+    match dest_url.find(':') {
+        // No colon at all: a relative path, not an absolute URL — same
+        // reasoning as the `None` arm of `is_safe_link_target`.
+        None => true,
+        Some(colon_idx) => dest_url[..colon_idx].contains(['/', '?', '#']),
+    }
+}
+
+/// Rewrites `dest_url` (an image target already passed through
+/// [`sanitize_link_target`]) to `/asset?p=<percent-encoded path>` when
+/// [`is_local_relative_image_target`] accepts it, so the live view fetches
+/// it from the running server (`GET /asset`, see `routes::handle_asset`)
+/// instead of a bare relative path the browser has no way to resolve
+/// against a file on disk. Left unchanged otherwise (a fragment, an
+/// absolute path, a remote URL, a `..`-escaping path, or one already
+/// neutralized to `#`) — see [`sanitize_events`]'s docs for when this runs
+/// at all.
+///
+/// A leading `./` is stripped before encoding (`./a.png` -> `p=a.png`,
+/// not `p=./a.png`): `routes::handle_asset` requires the decoded path to
+/// be made up only of `Component::Normal` segments, and `.` is
+/// [`Component::CurDir`], not `Normal` — an unstripped `./a.png` would
+/// round-trip into a request that route always rejects with `400`. If
+/// stripping every leading `./` leaves a path that itself starts with `/`
+/// (`.//a.png` -> `/a.png`), the target is left unchanged instead —
+/// `handle_asset` would reject that too (`Component::RootDir`), so
+/// rewriting it would only trade one always-`400` request for another.
+fn rewrite_local_image_target(dest_url: CowStr<'_>) -> CowStr<'_> {
+    if !is_local_relative_image_target(&dest_url) {
+        return dest_url;
+    }
+    let mut path = dest_url.as_ref();
+    while let Some(rest) = path.strip_prefix("./") {
+        path = rest;
+    }
+    if path.starts_with('/') {
+        // Stripping every leading `./` can still leave a root-relative
+        // path (`.//a.png` -> `/a.png`) that `routes::handle_asset` would
+        // always reject anyway (`Component::RootDir`, not `Normal`) —
+        // give up and leave the original target alone rather than produce
+        // a request guaranteed to `400`.
+        return dest_url;
+    }
+    let encoded = utf8_percent_encode(path, IMAGE_PATH_ENCODE_SET).to_string();
+    CowStr::from(format!("/asset?p={encoded}"))
+}
+
+/// Wraps a rendered body in the full HTML page: doctype, embedded
+/// stylesheet, a strict Content-Security-Policy, and — when `live` is
+/// `Some(version)` — the embedded live-reload script plus a three-pane
+/// layout: the file tree (`assets/tree.js`), the document, and the
+/// review-comments sidebar (`assets/review.js`).
+///
+/// `title` is HTML-escaped before being placed in `<title>`. `body_html` is
+/// assumed to already be safe HTML (i.e. the output of [`to_html`]) and is
+/// not escaped again.
+///
+/// `live` carries the live-reload baseline version rather than a plain
+/// `bool` so the caller (the HTTP server) can fix the baseline to the
+/// version in effect *before* it read the file for this response — see
+/// `server::respond_with_page` for why that ordering matters. `None` means
+/// no live-reload at all (used by `--export`): a single-column page with no
+/// scripts and no review sidebar, since there's no server to `PUT`
+/// comments to.
+///
+/// `allow_remote_images` controls the CSP's `img-src` — see
+/// [`content_security_policy`]. Threaded through from the CLI's
+/// `--allow-remote-images` flag by every caller (the native window,
+/// `--browser`, and `--export` alike).
+///
+/// `browser_mode` is `true` only for `--browser` (`server.rs`); the native
+/// window and `--export` both pass `false`. Stamped onto `<body
+/// data-mode="browser"|"native">` so `assets/viewer.js` can tell, without a
+/// round-trip, whether the doc header's back/forward buttons have anything
+/// to drive (`--browser` has no per-window history at all — `GET`/`PUT
+/// /nav` always answer accordingly, see `routes::handle`'s docs) or whether
+/// an `http(s)` link should be handed to `window.open` (`--browser`, whose
+/// clicks stay inside the same OS browser tab that's already showing the
+/// page) instead of left to the native `navigation_policy`/OS-browser path.
+/// Meaningless when `live` is `None` (`--export`'s standalone page has no
+/// scripts to read it), but still stamped for uniformity.
+pub fn page(
+    title: &str,
+    body_html: &str,
+    live: Option<u64>,
+    allow_remote_images: bool,
+    browser_mode: bool,
+) -> String {
+    let content_security_policy = content_security_policy(allow_remote_images);
+    let title = escape_html_text(title);
+    let mode_attr = if browser_mode { "browser" } else { "native" };
+    let body_section = match live {
+        Some(version) => format!(
+            "<div class=\"layout\">\n\
+             <aside class=\"tree\" id=\"tree\"></aside>\n\
+             <div class=\"splitter tree-splitter\" id=\"tree-splitter\"></div>\n\
+             <div class=\"doc-column\">\n\
+             <header class=\"doc-header\">\n\
+             <button type=\"button\" class=\"doc-nav-btn icon-btn chevron-left\" id=\"doc-back\" \
+             aria-label=\"Back\" title=\"Back (⌘[)\" disabled></button>\n\
+             <button type=\"button\" class=\"doc-nav-btn icon-btn chevron-right\" id=\"doc-forward\" \
+             aria-label=\"Forward\" title=\"Forward (⌘])\" disabled></button>\n\
+             <span class=\"doc-header-path\" id=\"doc-header-path\"></span>\n\
+             </header>\n\
+             <main class=\"markdown-body doc\">\n\
+             {body_html}\n\
+             </main>\n\
+             </div>\n\
+             <div class=\"splitter\" id=\"splitter\"></div>\n\
+             <aside class=\"review\" id=\"review\"></aside>\n\
+             </div>\n\
+             <script>window.__mdviewVersion=\"{version}\";</script>\n\
+             <script>\n{VIEWER_JS}\n</script>\n\
+             <script>\n{LIVE_JS}\n</script>\n\
+             <script>\n{REVIEW_JS}\n</script>\n\
+             <script>\n{TREE_JS}\n</script>"
+        ),
+        None => format!("<main class=\"markdown-body\">\n{body_html}\n</main>"),
+    };
+
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="{content_security_policy}">
+<title>{title}</title>
+<style>{STYLE_CSS}</style>
+</head>
+<body data-mode="{mode_attr}">
+{body_section}
+</body>
+</html>
+"#
+    )
+}
+
+/// Escapes text for use in an HTML text/attribute context (`&`, `<`, `>`,
+/// `"`, `'`). Used for the page title (plain text supplied by the caller —
+/// the file name — not Markdown), for the `data-excerpt` attributes
+/// [`to_html`]/[`push_anchor_open`] emit, and for every line of a
+/// plain-text document rendered by [`to_html_plain`], whose body never
+/// goes through pulldown-cmark's own escaping.
+fn escape_html_text(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_headings() {
+        let html = to_html("# Title\n\n## Subtitle", false);
+        assert!(html.contains("<h1>Title</h1>"));
+        assert!(html.contains("<h2>Subtitle</h2>"));
+    }
+
+    #[test]
+    fn renders_emphasis() {
+        let html = to_html("*em* and **strong**", false);
+        assert!(html.contains("<em>em</em>"));
+        assert!(html.contains("<strong>strong</strong>"));
+    }
+
+    #[test]
+    fn renders_code_blocks() {
+        let html = to_html("```\nlet x = 1;\n```", false);
+        assert!(html.contains("<pre><code>"));
+        assert!(html.contains("let x = 1;"));
+    }
+
+    #[test]
+    fn renders_tables() {
+        let html = to_html("| a | b |\n|---|---|\n| 1 | 2 |\n", false);
+        assert!(html.contains("<table>"));
+        assert!(html.contains("<th>a</th>"));
+        assert!(html.contains("<td>1</td>"));
+    }
+
+    #[test]
+    fn renders_strikethrough() {
+        let html = to_html("~~gone~~", false);
+        assert!(html.contains("<del>gone</del>"));
+    }
+
+    #[test]
+    fn renders_task_lists() {
+        let html = to_html("- [ ] todo\n- [x] done\n", false);
+        assert!(html.contains(r#"type="checkbox""#));
+        assert!(html.contains("checked"));
+    }
+
+    #[test]
+    fn renders_footnotes() {
+        let html = to_html("Body text[^1].\n\n[^1]: A note.\n", false);
+        assert!(html.contains("footnote-reference"));
+        assert!(html.contains("footnote-definition"));
+    }
+
+    #[test]
+    fn escapes_raw_html_instead_of_passing_it_through() {
+        let html = to_html("<script>alert(1)</script>", false);
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(!html.contains("<script>"));
+    }
+
+    #[test]
+    fn escapes_inline_raw_html() {
+        let html = to_html("before <b>bold</b> after", false);
+        assert!(html.contains("&lt;b&gt;"));
+        assert!(!html.contains("<b>"));
+    }
+
+    #[test]
+    fn discards_html_comments() {
+        let html = to_html("<!-- x -->\n\ntext", false);
+        assert!(!html.contains("x -->"));
+        assert!(!html.contains("<!--"));
+        assert!(html.contains("text"));
+    }
+
+    #[test]
+    fn discards_inline_html_comments() {
+        let html = to_html("before <!-- secret --> after", false);
+        assert!(!html.contains("secret"));
+        assert!(!html.contains("<!--"));
+    }
+
+    #[test]
+    fn discards_multiline_html_comments_entirely() {
+        // pulldown-cmark emits one `Html` event per line here
+        // (`<!--\n`, `secret\n`, `-->\n`); a naive per-event
+        // "starts with `<!--`" check only catches the first of the three
+        // and lets `secret` leak through as escaped text.
+        let html = to_html("<!--\nsecret\n-->\n\ntext", false);
+        assert!(!html.contains("secret"));
+        assert!(!html.contains("<!--"));
+        assert!(!html.contains("-->"));
+        assert!(html.contains("text"));
+    }
+
+    #[test]
+    fn keeps_real_content_sharing_a_line_with_a_comment() {
+        // The whole line is a single `Html` event here. Dropping any event
+        // that merely *starts with* `<!--` would discard "visible" along
+        // with the comment.
+        let html = to_html("<!-- secretword --> visible\n", false);
+        assert!(!html.contains("secretword"));
+        assert!(!html.contains("<!--"));
+        assert!(html.contains("visible"));
+    }
+
+    #[test]
+    fn discards_crlf_html_comments() {
+        let html = to_html("<!--\r\nsecret\r\n-->\r\n\r\ntext", false);
+        assert!(!html.contains("secret"));
+        assert!(!html.contains("<!--"));
+        assert!(html.contains("text"));
+    }
+
+    #[test]
+    fn renders_ordinary_html_blocks_as_escaped_text() {
+        let html = to_html("<div>x</div>\n", false);
+        assert!(html.contains("&lt;div&gt;x&lt;/div&gt;"));
+        assert!(!html.contains("<div>x</div>"));
+    }
+
+    #[test]
+    fn neutralizes_javascript_link_target() {
+        let html = to_html("[x](javascript:alert(1))", false);
+        assert!(!html.contains("javascript:"));
+        assert!(html.contains("href=\"#\""));
+    }
+
+    #[test]
+    fn neutralizes_data_link_target() {
+        let html = to_html("[y](data:text/html,alert(1))", false);
+        assert!(!html.contains("data:"));
+        assert!(html.contains("href=\"#\""));
+    }
+
+    #[test]
+    fn neutralizes_javascript_reference_link_target() {
+        let html = to_html("[z][r]\n\n[r]: JaVaScRiPt:alert(1)\n", false);
+        assert!(!html.to_lowercase().contains("javascript:"));
+        assert!(html.contains("href=\"#\""));
+    }
+
+    #[test]
+    fn neutralizes_javascript_image_target() {
+        let html = to_html("![i](javascript:alert(1))", false);
+        assert!(!html.contains("javascript:"));
+        assert!(html.contains("src=\"#\""));
+    }
+
+    // -- rewrite_local_images: local image dest_url -> /asset?p=... --------
+
+    #[test]
+    fn rewrites_a_relative_image_target_to_asset_route_when_enabled() {
+        let html = to_html("![x](img.png)", true);
+        assert!(html.contains(r#"src="/asset?p=img.png""#), "{html}");
+    }
+
+    #[test]
+    fn rewrites_a_subdirectory_image_target_preserving_the_path() {
+        let html = to_html("![x](imgs/a.png)", true);
+        assert!(html.contains(r#"src="/asset?p=imgs/a.png""#), "{html}");
+    }
+
+    #[test]
+    fn percent_encodes_special_characters_in_a_rewritten_image_path() {
+        // A raw space in a link/image destination needs the `<...>`
+        // bracketed form in CommonMark; unbracketed, pulldown-cmark
+        // doesn't parse this as an image target at all.
+        let html = to_html("![x](<my image.png>)", true);
+        assert!(html.contains("src=\"/asset?p=my%20image.png\""), "{html}");
+    }
+
+    #[test]
+    fn leaves_relative_image_targets_alone_when_rewriting_is_disabled() {
+        let html = to_html("![x](img.png)", false);
+        assert!(html.contains(r#"src="img.png""#), "{html}");
+        assert!(!html.contains("/asset"), "{html}");
+    }
+
+    #[test]
+    fn does_not_rewrite_a_remote_image_target() {
+        let html = to_html("![x](https://example.com/img.png)", true);
+        assert!(
+            html.contains(r#"src="https://example.com/img.png""#),
+            "{html}"
+        );
+        assert!(!html.contains("/asset"), "{html}");
+    }
+
+    #[test]
+    fn does_not_rewrite_a_root_relative_image_target() {
+        let html = to_html("![x](/etc/passwd)", true);
+        assert!(html.contains(r#"src="/etc/passwd""#), "{html}");
+        assert!(!html.contains("/asset"), "{html}");
+    }
+
+    #[test]
+    fn does_not_rewrite_a_protocol_relative_image_target() {
+        let html = to_html("![x](//evil.example/img.png)", true);
+        assert!(!html.contains("evil.example"), "{html}");
+        assert!(!html.contains("/asset"), "{html}");
+        assert!(html.contains("src=\"#\""), "{html}");
+    }
+
+    #[test]
+    fn does_not_rewrite_a_fragment_image_target() {
+        let html = to_html("![x](#frag)", true);
+        assert!(html.contains("src=\"#frag\""), "{html}");
+        assert!(!html.contains("/asset"), "{html}");
+    }
+
+    #[test]
+    fn a_neutralized_javascript_image_target_is_still_hash_not_asset() {
+        // rewrite_local_images must not run on a target that
+        // sanitize_link_target already replaced with `#` — `#` itself
+        // starts with `#`, so is_local_relative_image_target must reject
+        // it regardless.
+        let html = to_html("![i](javascript:alert(1))", true);
+        assert!(!html.contains("javascript:"));
+        assert!(!html.contains("/asset"), "{html}");
+        assert!(html.contains("src=\"#\""));
+    }
+
+    #[test]
+    fn does_not_rewrite_a_link_target_only_an_image_target() {
+        let html = to_html("[a](img.png)", true);
+        assert!(html.contains(r#"href="img.png""#), "{html}");
+        assert!(!html.contains("/asset"), "{html}");
+    }
+
+    #[test]
+    fn does_not_rewrite_a_parent_directory_escaping_image_target() {
+        let html = to_html("![x](../a.png)", true);
+        assert!(html.contains(r#"src="../a.png""#), "{html}");
+        assert!(!html.contains("/asset"), "{html}");
+    }
+
+    #[test]
+    fn does_not_rewrite_an_image_target_with_a_parent_dir_segment_mid_path() {
+        let html = to_html("![x](a/../b.png)", true);
+        assert!(html.contains(r#"src="a/../b.png""#), "{html}");
+        assert!(!html.contains("/asset"), "{html}");
+    }
+
+    #[test]
+    fn rewrites_a_leading_current_dir_image_target_stripping_the_dot_slash() {
+        let html = to_html("![x](./a.png)", true);
+        assert!(html.contains(r#"src="/asset?p=a.png""#), "{html}");
+    }
+
+    #[test]
+    fn does_not_rewrite_when_stripping_leading_dot_slashes_leaves_a_root_relative_path() {
+        // `.//a.png` has no `..` segment (so `is_local_relative_image_target`
+        // accepts it), but stripping every leading `./` leaves `/a.png` —
+        // root-relative, which `routes::handle_asset` always rejects
+        // (`Component::RootDir`, not `Normal`). Rewriting it would only
+        // produce a request guaranteed to `400`.
+        let html = to_html("![x](.//a.png)", true);
+        assert!(html.contains(r#"src=".//a.png""#), "{html}");
+        assert!(!html.contains("/asset"), "{html}");
+    }
+
+    #[test]
+    fn neutralizes_link_target_with_surrounding_whitespace_and_mixed_case() {
+        let html = to_html("[w]( JAVASCRIPT:x)", false);
+        assert!(!html.to_lowercase().contains("javascript:"));
+        assert!(html.contains("href=\"#\""));
+    }
+
+    #[test]
+    fn neutralizes_protocol_relative_link_target() {
+        let html = to_html("[p](//evil.example/x)", false);
+        assert!(!html.contains("evil.example"));
+        assert!(html.contains("href=\"#\""));
+    }
+
+    #[test]
+    fn keeps_allowed_link_schemes_and_relative_paths() {
+        assert!(
+            to_html("[a](https://example.com)", false).contains(r#"href="https://example.com""#)
+        );
+
+        let mailto_html = to_html("[b](mailto:a@example.com)", false);
+        assert!(mailto_html.contains("href=\"mailto:"));
+        assert!(!mailto_html.contains("href=\"#\""));
+
+        assert!(to_html("[c](#frag)", false).contains("href=\"#frag\""));
+        assert!(to_html("[d](./a.md)", false).contains(r#"href="./a.md""#));
+        assert!(to_html("[e](a/b:c)", false).contains(r#"href="a/b:c""#));
+    }
+
+    #[test]
+    fn trims_whitespace_from_an_allowed_link_target() {
+        // Angle-bracket reference definitions like `< https://example.com >`
+        // preserve the internal leading/trailing spaces in `dest_url`; left
+        // untrimmed, `escape_href` would percent-encode them (`%20...`)
+        // instead of producing a clean `https://example.com` URL.
+        let html = to_html("[r][ref]\n\n[ref]: < https://example.com >\n", false);
+        assert!(html.contains(r#"href="https://example.com""#));
+        assert!(!html.contains("%20"));
+    }
+
+    #[test]
+    fn page_with_live_includes_version_baseline_and_polling() {
+        let html = page("Doc", "<p>hi</p>", Some(7), false, false);
+        assert!(html.contains(r#"__mdviewVersion="7""#));
+        assert!(html.contains("/version"));
+        assert!(html.contains("<script>"));
+    }
+
+    #[test]
+    fn live_reload_script_aborts_stalled_fetches() {
+        // The embedded live-reload JS should bound each poll with an
+        // AbortController-based timeout rather than letting a stalled
+        // fetch hold `requestInFlight` (and so the in-flight guard) open
+        // forever.
+        let html = page("Doc", "<p>hi</p>", Some(1), false, false);
+        assert!(html.contains("AbortController"));
+        assert!(html.contains("signal"));
+    }
+
+    #[test]
+    fn page_without_live_excludes_version_polling() {
+        let html = page("Doc", "<p>hi</p>", None, false, false);
+        assert!(!html.contains("__mdviewVersion"));
+        assert!(!html.contains("/version"));
+        assert!(!html.contains("<script>"));
+    }
+
+    #[test]
+    fn page_with_live_includes_a_two_pane_layout_and_review_script() {
+        let html = page("Doc", "<p>hi</p>", Some(1), false, false);
+        assert!(html.contains(r#"<div class="layout">"#));
+        assert!(html.contains(r#"class="markdown-body doc""#));
+        assert!(html.contains(r#"<aside class="review" id="review"></aside>"#));
+        // review.js content (a distinctive, stable identifier from it).
+        assert!(html.contains("__mdviewReview"));
+    }
+
+    #[test]
+    fn page_with_live_includes_the_tree_pane_and_script() {
+        let html = page("Doc", "<p>hi</p>", Some(1), false, false);
+        assert!(html.contains(r#"<aside class="tree" id="tree"></aside>"#));
+        assert!(html.contains(r#"id="tree-splitter""#));
+        // tree.js content (a distinctive, stable identifier from it).
+        assert!(html.contains("__mdviewTree"));
+    }
+
+    #[test]
+    fn page_with_live_orders_tree_before_doc_before_review() {
+        let html = page("Doc", "<p>hi</p>", Some(1), false, false);
+        let tree_idx = html
+            .find(r#"<aside class="tree""#)
+            .expect("tree aside present");
+        let tree_splitter_idx = html
+            .find("id=\"tree-splitter\"")
+            .expect("tree splitter present");
+        let doc_idx = html.find("markdown-body doc").expect("doc pane present");
+        let review_splitter_idx = html
+            .find("id=\"splitter\"")
+            .expect("review splitter present");
+        let review_aside_idx = html
+            .find(r#"<aside class="review""#)
+            .expect("review aside present");
+        assert!(tree_idx < tree_splitter_idx);
+        assert!(tree_splitter_idx < doc_idx);
+        assert!(doc_idx < review_splitter_idx);
+        assert!(review_splitter_idx < review_aside_idx);
+    }
+
+    #[test]
+    fn page_with_live_includes_the_doc_header_between_the_tree_splitter_and_main() {
+        let html = page("Doc", "<p>hi</p>", Some(1), false, false);
+        assert!(html.contains(r#"<header class="doc-header">"#));
+        assert!(html.contains(r#"id="doc-back""#));
+        assert!(html.contains(r#"id="doc-forward""#));
+        assert!(html.contains(r#"id="doc-header-path""#));
+        let tree_splitter_idx = html
+            .find("id=\"tree-splitter\"")
+            .expect("tree splitter present");
+        let header_idx = html.find(r#"<header class="doc-header">"#).unwrap();
+        let doc_idx = html.find("markdown-body doc").expect("doc pane present");
+        assert!(tree_splitter_idx < header_idx);
+        assert!(header_idx < doc_idx);
+    }
+
+    #[test]
+    fn page_without_live_has_no_doc_header() {
+        let html = page("Doc", "<p>hi</p>", None, false, false);
+        // Not a bare `!html.contains("doc-header")`: the embedded
+        // stylesheet always defines `.doc-header`'s CSS rules regardless of
+        // `live` (same reasoning as the `#splitter` check above) — only
+        // the *element* itself is telling.
+        assert!(!html.contains("<header class=\"doc-header\">"));
+    }
+
+    #[test]
+    fn page_defaults_to_native_mode() {
+        let html = page("Doc", "<p>hi</p>", Some(1), false, false);
+        assert!(html.contains(r#"<body data-mode="native">"#));
+    }
+
+    #[test]
+    fn page_stamps_browser_mode_when_requested() {
+        let html = page("Doc", "<p>hi</p>", Some(1), false, true);
+        assert!(html.contains(r#"<body data-mode="browser">"#));
+    }
+
+    #[test]
+    fn page_without_live_has_no_tree_pane_or_script() {
+        let html = page("Doc", "<p>hi</p>", None, false, false);
+        assert!(!html.contains("class=\"tree\""));
+        assert!(!html.contains("__mdviewTree"));
+    }
+
+    #[test]
+    fn page_with_live_includes_the_pane_splitter() {
+        let html = page("Doc", "<p>hi</p>", Some(1), false, false);
+        assert!(html.contains(r#"class="splitter" id="splitter""#));
+        // The splitter must sit between the doc pane and the review aside
+        // (not just *an* aside — the tree pane is also an `<aside>` now,
+        // and sits before the doc pane, so the search has to be specific).
+        let splitter_idx = html.find("id=\"splitter\"").expect("splitter present");
+        let doc_idx = html.find("markdown-body doc").expect("doc pane present");
+        let aside_idx = html
+            .find(r#"<aside class="review""#)
+            .expect("review aside present");
+        assert!(doc_idx < splitter_idx && splitter_idx < aside_idx);
+    }
+
+    #[test]
+    fn page_with_live_embeds_the_viewer_script_before_live_js() {
+        let html = page("Doc", "<p>hi</p>", Some(1), false, false);
+        // viewer.js content (a distinctive, stable identifier from it).
+        assert!(html.contains("__mdviewViewer"));
+        let viewer_idx = html.find("__mdviewViewer").expect("viewer script present");
+        let live_idx = html.find("AbortController").expect("live.js present");
+        assert!(
+            viewer_idx < live_idx,
+            "viewer.js must be embedded before live.js"
+        );
+    }
+
+    #[test]
+    fn page_without_live_has_no_layout_aside_splitter_or_scripts() {
+        let html = page("Doc", "<p>hi</p>", None, false, false);
+        assert!(!html.contains("class=\"layout\""));
+        assert!(!html.contains("<aside"));
+        // Not a bare `!html.contains("splitter")`: the embedded stylesheet
+        // (assets/style.css) always defines `.splitter`'s CSS rules
+        // regardless of `live`, so only the *element* itself is telling.
+        assert!(!html.contains("id=\"splitter\""));
+        assert!(!html.contains("__mdviewReview"));
+        assert!(!html.contains("__mdviewViewer"));
+    }
+
+    #[test]
+    fn page_includes_content_security_policy() {
+        let html = page("Doc", "<p>hi</p>", None, false, false);
+        assert!(html.contains("Content-Security-Policy"));
+        assert!(html.contains("default-src 'none'"));
+    }
+
+    #[test]
+    fn page_blocks_remote_images_by_default() {
+        let html = page("Doc", "<p>hi</p>", None, false, false);
+        assert!(html.contains("img-src data: 'self';"));
+        assert!(!html.contains("img-src data: 'self' http: https:"));
+    }
+
+    #[test]
+    fn page_img_src_includes_self_by_default_for_local_asset_images() {
+        // `/asset?p=...` (see routes::handle_asset) is same-origin, so
+        // img-src must allow 'self' even when remote images are blocked.
+        let html = page("Doc", "<p>hi</p>", None, false, false);
+        assert!(html.contains("img-src data: 'self';"));
+    }
+
+    #[test]
+    fn page_allows_remote_images_when_opted_in() {
+        let html = page("Doc", "<p>hi</p>", None, true, false);
+        assert!(html.contains("img-src data: 'self' http: https:"));
+    }
+
+    #[test]
+    fn page_escapes_title() {
+        let html = page("<script>alert(1)</script>", "<p>hi</p>", None, false, false);
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!html.contains("<title><script>"));
+    }
+
+    #[test]
+    fn page_embeds_body_unescaped() {
+        let html = page("Doc", "<p>hi</p>", None, false, false);
+        assert!(html.contains("<p>hi</p>"));
+    }
+
+    // -- blocks() / to_html() block-splitting ---------------------------
+
+    #[test]
+    fn splits_paragraphs_headings_and_rules_into_separate_blocks() {
+        let md = "# Title\n\nFirst paragraph.\n\n---\n\nSecond paragraph.\n";
+        let blocks = blocks(md);
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0].source, "# Title");
+        assert_eq!(blocks[1].source, "First paragraph.");
+        assert_eq!(blocks[2].source, "---");
+        assert_eq!(blocks[3].source, "Second paragraph.");
+    }
+
+    #[test]
+    fn a_list_is_a_single_block_regardless_of_item_count() {
+        let md = "- one\n- two\n- three\n";
+        let blocks = blocks(md);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].source, "- one\n- two\n- three");
+    }
+
+    #[test]
+    fn a_table_is_a_single_block() {
+        let md = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let blocks = blocks(md);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].source.starts_with("| a | b |"));
+    }
+
+    #[test]
+    fn a_blockquote_is_a_single_block() {
+        let md = "> line one\n> line two\n";
+        let blocks = blocks(md);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].source, "> line one\n> line two");
+    }
+
+    #[test]
+    fn a_fenced_code_block_is_a_single_block() {
+        let md = "```rust\nlet x = 1;\nlet y = 2;\n```\n";
+        let blocks = blocks(md);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].source.starts_with("```rust"));
+        assert!(blocks[0].source.ends_with("```"));
+    }
+
+    #[test]
+    fn a_raw_html_block_is_a_single_block() {
+        let md = "before\n\n<div>\nraw\n</div>\n\nafter\n";
+        let blocks = blocks(md);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].source, "before");
+        assert!(blocks[1].source.contains("<div>"));
+        assert_eq!(blocks[2].source, "after");
+    }
+
+    #[test]
+    fn blocks_preserve_document_order() {
+        let md = "# H\n\npara\n\n- li\n\n```\ncode\n```\n";
+        let blocks = blocks(md);
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0].source, "# H");
+        assert_eq!(blocks[1].source, "para");
+        assert!(blocks[2].source.starts_with("- li"));
+        assert!(blocks[3].source.starts_with("```"));
+    }
+
+    #[test]
+    fn hash_is_stable_for_identical_input() {
+        let md = "# Title\n\nSome text.\n";
+        let first = blocks(md);
+        let second = blocks(md);
+        assert_eq!(first.len(), second.len());
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert_eq!(a.hash, b.hash);
+        }
+    }
+
+    #[test]
+    fn hash_changes_when_source_changes_by_one_character() {
+        let a = blocks("Some text.")[0].hash.clone();
+        let b = blocks("Some text!")[0].hash.clone();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hash_is_16_lowercase_hex_characters() {
+        let block = &blocks("# Title\n")[0];
+        assert_eq!(block.hash.len(), 16);
+        assert!(block.hash.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(block.hash, block.hash.to_lowercase());
+    }
+
+    #[test]
+    fn identical_blocks_hash_the_same() {
+        let blocks = blocks("Same text.\n\nSame text.\n");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].hash, blocks[1].hash);
+    }
+
+    #[test]
+    fn excerpt_is_the_first_line_truncated_to_80_chars() {
+        let long_line = "x".repeat(120);
+        let md = format!("{long_line}\n");
+        let block = &blocks(&md)[0];
+        assert_eq!(block.excerpt.chars().count(), 80);
+        assert_eq!(block.excerpt, "x".repeat(80));
+    }
+
+    #[test]
+    fn heading_excerpt_is_the_heading_line_itself() {
+        let block = &blocks("## Design notes\n")[0];
+        assert_eq!(block.excerpt, "## Design notes");
+    }
+
+    #[test]
+    fn code_block_excerpt_skips_the_fence_line() {
+        let block = &blocks("```rust\nlet x = 1;\n```\n")[0];
+        assert_eq!(block.excerpt, "let x = 1;");
+    }
+
+    // -- line_start / line_end -------------------------------------------
+
+    #[test]
+    fn line_start_and_line_end_are_computed_per_block() {
+        // Line numbers (1-based):
+        // 1: # Title
+        // 2: (blank)
+        // 3: Line 1
+        // 4: Line 2
+        // 5: Line 3
+        // 6: (blank)
+        // 7: ```
+        // 8: code line
+        // 9: ```
+        let md = "# Title\n\nLine 1\nLine 2\nLine 3\n\n```\ncode line\n```\n";
+        let blocks = blocks(md);
+        assert_eq!(blocks.len(), 3);
+
+        assert_eq!(blocks[0].source, "# Title");
+        assert_eq!(blocks[0].line_start, 1);
+        assert_eq!(blocks[0].line_end, 1);
+
+        assert_eq!(blocks[1].source, "Line 1\nLine 2\nLine 3");
+        assert_eq!(blocks[1].line_start, 3);
+        assert_eq!(blocks[1].line_end, 5);
+
+        assert!(blocks[2].source.starts_with("```"));
+        assert_eq!(blocks[2].line_start, 7);
+        assert_eq!(blocks[2].line_end, 9);
+    }
+
+    #[test]
+    fn line_numbers_are_correct_with_crlf_line_endings() {
+        let md = "# Title\r\n\r\nLine 1\r\nLine 2\r\nLine 3\r\n";
+        let blocks = blocks(md);
+        assert_eq!(blocks.len(), 2);
+
+        assert_eq!(blocks[0].line_start, 1);
+        assert_eq!(blocks[0].line_end, 1);
+
+        assert_eq!(blocks[1].line_start, 3);
+        assert_eq!(blocks[1].line_end, 5);
+    }
+
+    /// Finds every `data-hash="..."` value that belongs to a *block*-level
+    /// `.blk` div specifically (i.e. immediately preceded by
+    /// `data-kind="block" `), skipping any nested `data-hash` on an
+    /// `li.anchor`/`tr.anchor` — used by the tests below that check
+    /// `to_html`'s block-level divs against `blocks()`, which now coexist
+    /// with (and would otherwise be outnumbered by) nested item/row anchor
+    /// hashes.
+    fn block_level_hashes(html: &str) -> Vec<&str> {
+        const MARKER: &str = "data-kind=\"block\" data-hash=\"";
+        html.match_indices(MARKER)
+            .map(|(idx, _)| {
+                let rest = &html[idx + MARKER.len()..];
+                &rest[..rest.find('"').expect("closing quote")]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn to_html_wraps_every_block_in_a_data_hash_div_matching_blocks() {
+        let md = "# H\n\npara\n\n- li\n\n```\ncode\n```\n";
+        let expected = blocks(md);
+        let html = to_html(md, false);
+
+        let found_hashes = block_level_hashes(&html);
+
+        assert_eq!(found_hashes.len(), expected.len());
+        for (found, block) in found_hashes.iter().zip(expected.iter()) {
+            assert_eq!(*found, block.hash);
+        }
+    }
+
+    #[test]
+    fn to_html_still_contains_expected_fragment_content_when_wrapped() {
+        let html = to_html("# Hello\n", false);
+        assert!(html.contains("<h1>Hello</h1>"));
+        assert!(html.contains("class=\"blk\""));
+    }
+
+    #[test]
+    fn to_html_includes_data_line_start_and_data_line_end_attributes() {
+        let html = to_html("# Title\n\nLine 1\nLine 2\nLine 3\n", false);
+        assert!(html.contains("data-line-start=\"1\" data-line-end=\"1\""));
+        assert!(html.contains("data-line-start=\"3\" data-line-end=\"5\""));
+    }
+
+    #[test]
+    fn to_html_includes_an_escaped_data_excerpt_attribute() {
+        let html = to_html("Has <angle> & amp\n", false);
+        // `<angle>` survives sanitize_events as literal, escaped text
+        // (see escapes_inline_raw_html); the excerpt built from that text
+        // must itself be HTML-escaped before landing in an attribute value.
+        assert!(html.contains("data-excerpt=\"Has &lt;angle&gt; &amp; amp\""));
+    }
+
+    #[test]
+    fn data_excerpt_never_leaks_a_neutralized_javascript_link_target() {
+        // A regression check for a real bug caught while adding
+        // data-excerpt: an earlier version built the excerpt from the raw
+        // Markdown source (the same string `blocks()`/`excerpt_of` use),
+        // which for a link is literally `[label](url)` — that would have
+        // put the neutralized `javascript:` URL right back into the page,
+        // just in a different attribute, undoing sanitize_events' whole
+        // point. The excerpt here must come from sanitized text content
+        // only.
+        let html = to_html("[click me](javascript:alert(1))\n", false);
+        assert!(!html.contains("javascript:"));
+        assert!(html.contains("data-excerpt=\"click me\""));
+    }
+
+    #[test]
+    fn data_excerpt_never_leaks_a_discarded_html_comment() {
+        let html = to_html("<!-- secretword --> visible text\n", false);
+        assert!(!html.contains("secretword"));
+        assert!(html.contains("data-excerpt=\"visible text\""));
+    }
+
+    #[test]
+    fn blocks_and_to_html_agree_on_a_document_with_nested_and_adjacent_block_types() {
+        // Exercises: a footnote definition, a fenced code block nested
+        // inside a list item, a list nested inside a blockquote, and a
+        // table immediately followed by a thematic break — all in one
+        // document, to catch any depth-tracking edge case that a simpler
+        // fixture wouldn't.
+        let md = "\
+Body text[^1].
+
+[^1]: A footnote definition with some text.
+
+- item one
+  ```
+  code fence inside a list item
+  ```
+- item two
+
+> quoted intro
+> - quoted item one
+> - quoted item two
+
+| a | b |
+|---|---|
+| 1 | 2 |
+
+---
+
+final paragraph
+";
+        let expected = blocks(md);
+
+        // Sanity-check the fixture itself: every feature this test means
+        // to exercise must actually be present as its own top-level
+        // block, or a parser/split change could make the rest of this
+        // test vacuously pass.
+        assert!(
+            expected.iter().any(|b| b.source.starts_with("[^1]:")),
+            "no footnote-definition block in {expected:#?}"
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|b| b.source.starts_with('-') && b.source.contains("```")),
+            "no list-with-nested-code-fence block in {expected:#?}"
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|b| b.source.starts_with('>') && b.source.contains("- quoted")),
+            "no blockquote-with-nested-list block in {expected:#?}"
+        );
+        assert!(
+            expected.iter().any(|b| b.source.starts_with('|')),
+            "no table block in {expected:#?}"
+        );
+        assert!(
+            expected.iter().any(|b| b.source == "---"),
+            "no thematic-break block in {expected:#?}"
+        );
+
+        let html = to_html(md, false);
+        let found_hashes = block_level_hashes(&html);
+
+        assert_eq!(found_hashes.len(), expected.len());
+        for (found, block) in found_hashes.iter().zip(expected.iter()) {
+            assert_eq!(*found, block.hash);
+        }
+    }
+
+    // -- anchors(): nested list items and table rows ---------------------
+
+    #[test]
+    fn anchors_include_blocks_items_and_rows_in_document_order() {
+        let md = "- one\n- two\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let anchors = anchors(md);
+        let kinds: Vec<AnchorKind> = anchors.iter().map(|a| a.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                AnchorKind::Block, // the list
+                AnchorKind::Item,  // "one"
+                AnchorKind::Item,  // "two"
+                AnchorKind::Block, // the table
+                AnchorKind::Row,   // header row
+                AnchorKind::Row,   // "| 1 | 2 |"
+            ]
+        );
+    }
+
+    #[test]
+    fn item_anchors_have_the_enclosing_block_as_parent() {
+        let md = "- one\n- two\n";
+        let anchors = anchors(md);
+        assert_eq!(anchors[0].kind, AnchorKind::Block);
+        assert_eq!(anchors[1].parent, Some(0));
+        assert_eq!(anchors[2].parent, Some(0));
+    }
+
+    #[test]
+    fn nested_item_anchors_have_the_immediately_enclosing_item_as_parent() {
+        // Three levels deep: a top-level item containing a nested list
+        // whose item contains a further-nested list.
+        let md = "- outer\n  - middle\n    - inner\n";
+        let anchors = anchors(md);
+        assert_eq!(anchors.len(), 4); // block, outer, middle, inner
+        let block_idx = anchors
+            .iter()
+            .position(|a| a.kind == AnchorKind::Block)
+            .expect("block anchor");
+        let outer = anchors
+            .iter()
+            .position(|a| a.excerpt == "outer")
+            .expect("outer item");
+        let middle = anchors
+            .iter()
+            .position(|a| a.excerpt == "middle")
+            .expect("middle item");
+        let inner = anchors
+            .iter()
+            .position(|a| a.excerpt == "inner")
+            .expect("inner item");
+        assert_eq!(anchors[outer].parent, Some(block_idx));
+        assert_eq!(anchors[middle].parent, Some(outer));
+        assert_eq!(anchors[inner].parent, Some(middle));
+    }
+
+    #[test]
+    fn row_anchors_have_the_table_block_as_parent() {
+        let md = "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n";
+        let anchors = anchors(md);
+        assert_eq!(anchors[0].kind, AnchorKind::Block);
+        for row in &anchors[1..] {
+            assert_eq!(row.kind, AnchorKind::Row);
+            assert_eq!(row.parent, Some(0));
+        }
+    }
+
+    #[test]
+    fn item_excerpt_strips_bullet_task_and_ordered_markers() {
+        let md = "- 三番目の項目\n- [ ] todo item\n- [x] done item\n";
+        let found_anchors = anchors(md);
+        let items: Vec<&str> = found_anchors
+            .iter()
+            .filter(|a| a.kind == AnchorKind::Item)
+            .map(|a| a.excerpt.as_str())
+            .collect();
+        assert_eq!(items, vec!["三番目の項目", "todo item", "done item"]);
+
+        let ordered_anchors = anchors("1. first\n2. second\n");
+        let ordered_items: Vec<&str> = ordered_anchors
+            .iter()
+            .filter(|a| a.kind == AnchorKind::Item)
+            .map(|a| a.excerpt.as_str())
+            .collect();
+        assert_eq!(ordered_items, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn row_excerpt_joins_cells_with_a_pipe_separator() {
+        let md = "| 値1 | 値2 | 値3 |\n|---|---|---|\n| a | b | c |\n";
+        let anchors = anchors(md);
+        let rows: Vec<&str> = anchors
+            .iter()
+            .filter(|a| a.kind == AnchorKind::Row)
+            .map(|a| a.excerpt.as_str())
+            .collect();
+        assert_eq!(rows, vec!["値1 | 値2 | 値3", "a | b | c"]);
+    }
+
+    #[test]
+    fn item_and_row_hashes_use_the_same_function_as_block_hashes() {
+        // A single-item list's block-level source ("- same text") and its
+        // sole item's own source are the identical string, so their hashes
+        // — computed by the same hash_source function regardless of kind —
+        // must match too.
+        let found = anchors("- same text\n");
+        let block_hash = &found
+            .iter()
+            .find(|a| a.kind == AnchorKind::Block)
+            .unwrap()
+            .hash;
+        let item_hash = &found
+            .iter()
+            .find(|a| a.kind == AnchorKind::Item)
+            .unwrap()
+            .hash;
+        assert_eq!(block_hash, item_hash);
+    }
+
+    #[test]
+    fn item_line_numbers_are_computed_per_item() {
+        let md = "- one\n- two\n- three\n";
+        let anchors = anchors(md);
+        let items: Vec<&Anchor> = anchors
+            .iter()
+            .filter(|a| a.kind == AnchorKind::Item)
+            .collect();
+        assert_eq!(items[0].line_start, 1);
+        assert_eq!(items[0].line_end, 1);
+        assert_eq!(items[1].line_start, 2);
+        assert_eq!(items[2].line_start, 3);
+    }
+
+    #[test]
+    fn row_line_numbers_skip_the_delimiter_line() {
+        let md = "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n";
+        let anchors = anchors(md);
+        let rows: Vec<&Anchor> = anchors
+            .iter()
+            .filter(|a| a.kind == AnchorKind::Row)
+            .collect();
+        assert_eq!(rows[0].line_start, 1); // header
+        assert_eq!(rows[1].line_start, 3); // first data row (line 2 is the delimiter)
+        assert_eq!(rows[2].line_start, 4);
+    }
+
+    #[test]
+    fn blocks_is_unaffected_by_nested_item_and_row_anchors() {
+        let md = "- one\n- two\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let block_list = blocks(md);
+        assert_eq!(block_list.len(), 2);
+        assert!(block_list[0].source.starts_with("- one"));
+        assert!(block_list[1].source.starts_with("| a | b |"));
+    }
+
+    // -- to_html(): nested anchor tags ------------------------------------
+
+    #[test]
+    fn to_html_wraps_list_items_in_anchor_li_tags() {
+        let html = to_html("- one\n- two\n", false);
+        assert!(html.contains(r#"<li class="anchor" data-kind="item""#));
+        assert_eq!(html.matches(r#"<li class="anchor""#).count(), 2);
+    }
+
+    #[test]
+    fn to_html_wraps_table_rows_in_anchor_tr_tags_including_the_header() {
+        let html = to_html("| a | b |\n|---|---|\n| 1 | 2 |\n", false);
+        assert!(html.contains(r#"<thead><tr class="anchor" data-kind="row""#));
+        assert_eq!(html.matches(r#"<tr class="anchor""#).count(), 2);
+        assert!(html.contains("</tr>\n</thead><tbody>\n"));
+        assert!(html.contains("</tbody></table>"));
+    }
+
+    #[test]
+    fn to_html_nested_list_items_each_get_their_own_anchor() {
+        let html = to_html("- outer\n  - middle\n    - inner\n", false);
+        assert_eq!(html.matches(r#"data-kind="item""#).count(), 3);
+    }
+
+    #[test]
+    fn to_html_anchors_and_anchors_agree_on_count_kind_and_order() {
+        let md = "\
+# Heading
+
+- one
+  - nested one
+  - nested two
+- two
+
+1. first
+2. second
+
+- [ ] todo
+- [x] done
+
+| a | b |
+|---|---|
+| 1 | 2 |
+| 3 | 4 |
+
+final paragraph
+";
+        let expected = anchors(md);
+        let html = to_html(md, false);
+
+        let found: Vec<(&str, &str)> = html
+            .match_indices("data-kind=\"")
+            .map(|(idx, _)| {
+                let kind_rest = &html[idx + "data-kind=\"".len()..];
+                let kind = &kind_rest[..kind_rest.find('"').expect("closing quote")];
+                let hash_marker = "data-hash=\"";
+                let hash_idx = kind_rest.find(hash_marker).expect("data-hash follows");
+                let hash_rest = &kind_rest[hash_idx + hash_marker.len()..];
+                let hash = &hash_rest[..hash_rest.find('"').expect("closing quote")];
+                (kind, hash)
+            })
+            .collect();
+
+        assert_eq!(found.len(), expected.len());
+        for ((found_kind, found_hash), anchor) in found.iter().zip(expected.iter()) {
+            let expected_kind = match anchor.kind {
+                AnchorKind::Block => "block",
+                AnchorKind::Item => "item",
+                AnchorKind::Row => "row",
+            };
+            assert_eq!(*found_kind, expected_kind, "anchor: {anchor:#?}");
+            assert_eq!(*found_hash, anchor.hash, "anchor: {anchor:#?}");
+        }
+    }
+
+    #[test]
+    fn to_html_table_cells_keep_column_alignment_styling_in_body_rows() {
+        // A regression check for a specific bug: rendering a body row's
+        // cells through a *fresh* `push_html` call
+        // (rather than replicating pulldown-cmark's own TableCell handling
+        // by hand) would default to head state (`<th>` instead of `<td>`)
+        // and lose column alignment entirely.
+        let html = to_html("| a | b |\n|:--|--:|\n| 1 | 2 |\n", false);
+        assert!(html.contains(r#"<td style="text-align: left">1</td>"#));
+        assert!(html.contains(r#"<td style="text-align: right">2</td>"#));
+        assert!(!html.contains("<th>1</th>"));
+    }
+
+    #[test]
+    fn to_html_keeps_table_alignment_for_a_table_nested_inside_a_blockquote() {
+        // Regression: to_html() used to only capture column alignments
+        // when the table WAS the top-level block (events.first() ==
+        // Start(Tag::Table(_))). A table quoted inside a blockquote is a
+        // block whose first event is Start(Tag::BlockQuote), so the old
+        // code never captured its alignments at all and every cell lost
+        // its text-align styling.
+        let html = to_html("> | a | b |\n> |:--|--:|\n> | 1 | 2 |\n", false);
+        assert!(
+            html.contains(r#"<td style="text-align: left">1</td>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<td style="text-align: right">2</td>"#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn to_html_keeps_table_alignment_for_a_table_nested_inside_a_list_item() {
+        let html = to_html("- item\n\n  | a | b |\n  |:--|--:|\n  | 1 | 2 |\n", false);
+        assert!(
+            html.contains(r#"<td style="text-align: left">1</td>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<td style="text-align: right">2</td>"#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn to_html_task_list_checkboxes_still_render_inside_item_anchors() {
+        let html = to_html("- [ ] todo\n- [x] done\n", false);
+        assert!(html.contains(r#"type="checkbox""#));
+        assert!(html.contains("checked"));
+        assert!(html.contains(r#"<li class="anchor" data-kind="item""#));
+    }
+
+    #[test]
+    fn to_html_item_data_excerpt_strips_the_marker_and_is_escaped() {
+        let html = to_html("- Has <angle> item\n", false);
+        assert!(html.contains(r#"data-kind="item""#));
+        let marker = "data-excerpt=\"";
+        let idx = html.find(marker).expect("a data-excerpt attribute exists");
+        // The *first* data-excerpt in the document belongs to the outer
+        // .blk div (whole-list excerpt keeps the marker); the item's own
+        // data-excerpt is the second one and must have it stripped.
+        let second = html[idx + marker.len()..]
+            .find(marker)
+            .map(|rel| idx + marker.len() + rel)
+            .expect("a second data-excerpt attribute exists (the item's)");
+        let rest = &html[second + marker.len()..];
+        let value = &rest[..rest.find('"').expect("closing quote")];
+        assert_eq!(value, "Has &lt;angle&gt; item");
+    }
+
+    #[test]
+    fn item_data_excerpt_never_leaks_a_neutralized_javascript_link_target() {
+        // The item-anchor analogue of
+        // data_excerpt_never_leaks_a_neutralized_javascript_link_target:
+        // an item's data-excerpt must come from sanitized content, not the
+        // raw Markdown source, even though the item is nested inside a
+        // list rather than being its own top-level block.
+        let html = to_html("- [click me](javascript:alert(1))\n", false);
+        assert!(!html.contains("javascript:"));
+        assert!(html.contains(r#"data-kind="item""#));
+        assert!(html.contains("data-excerpt=\"click me\""));
+    }
+
+    #[test]
+    fn item_data_excerpt_never_leaks_a_discarded_html_comment() {
+        let html = to_html("- <!-- secretword --> visible text\n", false);
+        assert!(!html.contains("secretword"));
+        assert!(html.contains(r#"data-kind="item""#));
+        assert!(html.contains("data-excerpt=\"visible text\""));
+    }
+
+    #[test]
+    fn to_html_row_data_excerpt_joins_cells() {
+        let html = to_html("| 値1 | 値2 |\n|---|---|\n| a | b |\n", false);
+        assert!(html.contains(r#"data-kind="row""#));
+        assert!(html.contains("data-excerpt=\"値1 | 値2\""));
+        assert!(html.contains("data-excerpt=\"a | b\""));
+    }
+
+    #[test]
+    fn blk_div_carries_data_kind_block() {
+        let html = to_html("# Title\n", false);
+        assert!(html.contains(r#"<div class="blk" data-kind="block""#));
+    }
+
+    // -- to_html() vs. plain push_html: content parity ---------------------
+    //
+    // `to_html` renders every block (and every nested item/row inside it)
+    // through its own hand-rolled interleaving of `<div>`/`<li>`/`<tr>`
+    // wrapper tags and per-run `push_html` calls (see `render_events_html`),
+    // rather than a single `push_html` call over the whole document. These
+    // tests assert that — once the wrapper markup `to_html` itself adds is
+    // stripped back out — the two ways of rendering agree on everything
+    // else, for a range of fixtures exercising the constructs most likely
+    // to expose a divergence: tight/loose lists, list markers/numbering,
+    // task lists, deep nesting, lists/tables inside a blockquote or a
+    // footnote definition, and code/blockquote/table content nested inside
+    // a list item.
+
+    /// Strips the anchor wrapper markup `to_html` adds — `<div class="blk"
+    /// ...>...</div>` around every block, and `class="anchor" data-kind=
+    /// "item"|"row" data-hash="..." data-line-start="..." data-line-end=
+    /// "..." data-excerpt="..."` on every nested `<li>`/`<tr>` — leaving
+    /// bare `<li>`/`<tr>` tags, so what remains can be compared against a
+    /// plain `pulldown_cmark::html::push_html` render of the same document.
+    /// Manual string scanning rather than a `regex` dependency (not a
+    /// project dependency, and this is test-only code operating on a small,
+    /// fixed set of attribute patterns `to_html` itself controls the exact
+    /// wording of): every attribute value `to_html` emits is HTML-escaped
+    /// (`escape_html_text`), so it can never itself contain an unescaped
+    /// `>` that would let a naive "find the next `>`" scan stop early.
+    fn strip_anchor_wrappers(html: &str) -> String {
+        let without_li = replace_tag_open(html, "<li class=\"anchor\"", "<li>");
+        let without_tr = replace_tag_open(&without_li, "<tr class=\"anchor\"", "<tr>");
+        remove_blk_wrapper_divs(&without_tr)
+    }
+
+    /// Removes every `<div class="blk" ...>...</div>\n` wrapper `to_html`
+    /// adds around a block, keeping the block's own inner HTML —
+    /// deliberately *not* just "delete every literal `<div class=\"blk\"
+    /// ...>` open tag, then every literal `</div>\n` close": a block can
+    /// legitimately render its own `<div>` (a footnote definition's
+    /// `<div class="footnote-definition">`, closed the same way with
+    /// `</div>\n`), and that naive approach would delete one of *those*
+    /// instead of the wrapper's own matching close once there's more than
+    /// one `</div>` in the document. Instead, from each `blk` div's own
+    /// opening tag, `<div`/`</div>` nesting depth is tracked forward to
+    /// find *that specific* div's matching close.
+    fn remove_blk_wrapper_divs(html: &str) -> String {
+        let mut out = String::with_capacity(html.len());
+        let mut pos = 0;
+        while let Some(rel) = html[pos..].find("<div class=\"blk\"") {
+            let open_start = pos + rel;
+            out.push_str(&html[pos..open_start]);
+            let open_tag_end = open_start
+                + html[open_start..]
+                    .find('>')
+                    .expect("blk div has a closing '>'")
+                + 1;
+
+            let mut depth = 1i32;
+            let mut cursor = open_tag_end;
+            let close_start = loop {
+                let next_open = html[cursor..].find("<div").map(|i| cursor + i);
+                let next_close = html[cursor..].find("</div>").map(|i| cursor + i);
+                match (next_open, next_close) {
+                    (Some(o), Some(c)) if o < c => {
+                        depth += 1;
+                        cursor = o + "<div".len();
+                    }
+                    (_, Some(c)) => {
+                        depth -= 1;
+                        cursor = c + "</div>".len();
+                        if depth == 0 {
+                            break c;
+                        }
+                    }
+                    _ => panic!("unbalanced <div> after a blk wrapper in test fixture output"),
+                }
+            };
+            out.push_str(&html[open_tag_end..close_start]);
+            pos = close_start + "</div>".len();
+            if html[pos..].starts_with('\n') {
+                pos += 1; // the `\n` to_html always appends after `</div>`.
+            }
+        }
+        out.push_str(&html[pos..]);
+        out
+    }
+
+    /// Replaces every opening tag in `html` that starts with the literal
+    /// `open_prefix` (up to and including its closing `>`) with
+    /// `replacement`, leaving everything else untouched.
+    fn replace_tag_open(html: &str, open_prefix: &str, replacement: &str) -> String {
+        let mut out = String::with_capacity(html.len());
+        let mut rest = html;
+        loop {
+            match rest.find(open_prefix) {
+                None => {
+                    out.push_str(rest);
+                    break;
+                }
+                Some(idx) => {
+                    out.push_str(&rest[..idx]);
+                    let after = &rest[idx..];
+                    let close = after.find('>').expect("tag has a closing '>'");
+                    out.push_str(replacement);
+                    rest = &after[close + 1..];
+                }
+            }
+        }
+        out
+    }
+
+    /// Drops every whitespace character. `to_html` renders a block's
+    /// content via several separate `push_html` calls (one per leaf run —
+    /// see `render_events_html`/`flush_leaf`) rather than one call over the
+    /// whole block; each such call resets pulldown-cmark's own
+    /// `end_newline` tracking, which can add or drop a blank
+    /// line/whitespace right at a run boundary without changing the
+    /// rendered page at all (whitespace between block-level tags is never
+    /// visible). Comparing with every whitespace character removed ignores
+    /// exactly that class of difference while still catching any real
+    /// (non-whitespace) content mismatch.
+    fn strip_all_whitespace(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// Asserts that `to_html(markdown)`, with its anchor wrapper markup
+    /// stripped, matches a plain `pulldown_cmark::html::push_html` render of
+    /// the same `markdown` (same `Options`, same `sanitize_events` pass),
+    /// ignoring whitespace-only differences.
+    fn assert_to_html_matches_push_html(markdown: &str) {
+        let ours_raw = to_html(markdown, false);
+        let ours = strip_all_whitespace(&strip_anchor_wrappers(&ours_raw));
+
+        let events: Vec<Event<'_>> = Parser::new_ext(markdown, markdown_options()).collect();
+        let sanitized = sanitize_events(events, false);
+        let mut canonical_raw = String::new();
+        html::push_html(&mut canonical_raw, sanitized.into_iter());
+        let canonical = strip_all_whitespace(&canonical_raw);
+
+        assert_eq!(
+            ours, canonical,
+            "\nmarkdown:\n{markdown}\n\nto_html (stripped):\n{ours_raw}\n\npush_html (canonical):\n{canonical_raw}\n"
+        );
+    }
+
+    #[test]
+    fn to_html_matches_push_html_for_a_tight_list() {
+        assert_to_html_matches_push_html("- one\n- two\n- three\n");
+    }
+
+    #[test]
+    fn to_html_matches_push_html_for_a_loose_list() {
+        assert_to_html_matches_push_html("- one\n\n- two\n\n- three\n");
+    }
+
+    #[test]
+    fn to_html_matches_push_html_for_an_ordered_list_starting_at_five() {
+        assert_to_html_matches_push_html("5. five\n6. six\n7. seven\n");
+    }
+
+    #[test]
+    fn to_html_matches_push_html_for_a_task_list() {
+        assert_to_html_matches_push_html("- [ ] todo\n- [x] done\n");
+    }
+
+    #[test]
+    fn to_html_matches_push_html_for_a_three_level_nested_list() {
+        assert_to_html_matches_push_html("- outer\n  - middle\n    - inner\n");
+    }
+
+    #[test]
+    fn to_html_matches_push_html_for_a_list_inside_a_blockquote() {
+        assert_to_html_matches_push_html("> - a\n> - b\n");
+    }
+
+    #[test]
+    fn to_html_matches_push_html_for_a_list_item_containing_a_code_fence_blockquote_and_table() {
+        assert_to_html_matches_push_html(
+            "- item with code\n  \
+             ```\n  \
+             code line\n  \
+             ```\n\
+             - item with quote\n  \
+             > quoted text\n\
+             - item with table\n\n  \
+             | a | b |\n  \
+             |---|---|\n  \
+             | 1 | 2 |\n",
+        );
+    }
+
+    #[test]
+    fn to_html_matches_push_html_for_table_alignment() {
+        assert_to_html_matches_push_html("| a | b | c |\n|:--|:--:|--:|\n| 1 | 2 | 3 |\n");
+    }
+
+    #[test]
+    fn to_html_matches_push_html_for_a_list_inside_a_footnote_definition() {
+        // Exactly one footnote in this fixture (referenced once, defined
+        // once): both `to_html`'s per-block/per-leaf-run push_html calls
+        // and a single whole-document push_html call assign it the same
+        // number ("1") regardless, since pulldown-cmark's footnote
+        // numbering starts fresh (an empty `numbers` map) at the start of
+        // *any* push_html call and this is the first (and only) footnote
+        // either call ever sees — so this fixture doesn't hit the known
+        // "footnote numbers reset per block" divergence a fixture with
+        // multiple footnotes across blocks would (see README's
+        // Limitations).
+        assert_to_html_matches_push_html(
+            "Body text[^1].\n\n[^1]: A note with a list:\n\n    - point one\n    - point two\n",
+        );
+    }
+
+    // -- recursion depth cap -----------------------------------------------
+
+    #[test]
+    fn deeply_nested_lists_do_not_panic_and_stay_within_the_anchor_depth_cap() {
+        // 200 levels of nesting, each indented two spaces further than its
+        // parent (matching a "- " marker's width) — well past
+        // MAX_ANCHOR_DEPTH. Neither anchors() nor to_html() should panic,
+        // and no more than MAX_ANCHOR_DEPTH Item anchors should ever be
+        // produced along a single nesting chain.
+        let mut md = String::new();
+        for level in 0..200 {
+            md.push_str(&"  ".repeat(level));
+            md.push_str("- level\n");
+        }
+
+        let html = to_html(&md, false);
+        assert!(!html.is_empty());
+        assert!(html.contains("level"));
+
+        let found = anchors(&md);
+        let item_count = found.iter().filter(|a| a.kind == AnchorKind::Item).count();
+        assert!(
+            item_count as u32 <= MAX_ANCHOR_DEPTH,
+            "item_count = {item_count}"
+        );
+    }
+
+    // -- frontmatter ---------------------------------------------------
+
+    #[test]
+    fn frontmatter_is_excluded_from_to_html_output() {
+        let md = "---\ntitle: foo\n---\n# body\n";
+        let html = to_html(md, false);
+        assert!(!html.contains("title:"));
+        assert!(!html.contains("<h2>"));
+        assert!(!html.contains("<hr"));
+        assert!(html.contains("<h1>body</h1>"));
+    }
+
+    #[test]
+    fn frontmatter_body_line_start_counts_from_the_original_file() {
+        let md = "---\ntitle: foo\n---\nbody\n";
+        let html = to_html(md, false);
+        assert!(html.contains("data-line-start=\"4\""));
+
+        let found = blocks(md);
+        assert_eq!(found[0].line_start, 4);
+    }
+
+    #[test]
+    fn frontmatter_without_a_closing_line_is_rendered_as_is() {
+        let md = "---\ntitle: x\n\n# body\n";
+        assert_eq!(frontmatter_len(md), 0);
+        assert!(to_html(md, false).contains("<hr"));
+    }
+
+    #[test]
+    fn frontmatter_can_be_closed_with_an_ellipsis_line() {
+        let md = "---\ntitle: x\n...\n# body\n";
+        let html = to_html(md, false);
+        assert!(!html.contains("title:"));
+        assert!(html.contains("<h1>body</h1>"));
+    }
+
+    #[test]
+    fn frontmatter_is_excluded_with_crlf_line_endings() {
+        let md = "---\r\ntitle: x\r\n---\r\n# body\r\n";
+        let html = to_html(md, false);
+        assert!(!html.contains("title:"));
+        assert!(html.contains("data-line-start=\"4\""));
+    }
+
+    #[test]
+    fn a_horizontal_rule_in_the_body_is_still_rendered() {
+        let md = "# a\n\n---\n\n# b\n";
+        assert!(to_html(md, false).contains("<hr"));
+    }
+
+    #[test]
+    fn a_leading_blank_line_disqualifies_frontmatter() {
+        let md = "\n---\ntitle: x\n---\n";
+        assert_eq!(frontmatter_len(md), 0);
+    }
+
+    #[test]
+    fn frontmatter_block_count_matches_between_blocks_and_to_html() {
+        let md = "---\ntitle: x\n---\n# a\n\npara\n";
+        let html = to_html(md, false);
+        assert_eq!(blocks(md).len(), block_level_hashes(&html).len());
+    }
+
+    #[test]
+    fn a_document_that_is_only_frontmatter_renders_as_empty_without_panicking() {
+        assert_eq!(to_html("---\ntitle: x\n---\n", false), "");
+    }
+
+    #[test]
+    fn a_document_that_is_only_frontmatter_with_no_trailing_newline_renders_as_empty_without_panicking(
+    ) {
+        assert_eq!(to_html("---\ntitle: x\n---", false), "");
+    }
+
+    #[test]
+    fn a_leading_bom_is_skipped_and_included_in_the_frontmatter_length() {
+        let md = "\u{FEFF}---\ntitle: x\n---\n# body\n";
+        let html = to_html(md, false);
+        assert!(html.contains("<h1>"));
+        assert!(!html.contains("title:"));
+        assert!(html.contains("data-line-start=\"4\""));
+    }
+
+    #[test]
+    fn frontmatter_delimiter_lines_tolerate_trailing_whitespace() {
+        let md = "---  \ntitle: x\n---\t\n# body\n";
+        let html = to_html(md, false);
+        assert!(!html.contains("title:"));
+        assert!(html.contains("<h1>body</h1>"));
+    }
+
+    #[test]
+    fn frontmatter_len_boundary_cases() {
+        assert_eq!(frontmatter_len(""), 0);
+        assert_eq!(frontmatter_len("---"), 0);
+        assert_eq!(frontmatter_len("----\nx\n----\n"), 0);
+
+        let md = "---\ntitle: 日本語タイトル\n---\n# 本文\n";
+        let html = to_html(md, false);
+        assert!(!html.contains("日本語タイトル"));
+        assert!(html.contains("<h1>本文</h1>"));
+    }
+
+    #[test]
+    fn frontmatter_does_not_change_anchors_other_than_shifting_line_numbers() {
+        let body = "- outer\n  - inner\n- two\n\n| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n";
+        let with_frontmatter = format!("---\ntitle: x\n---\n{body}");
+
+        let without = anchors(body);
+        let with = anchors(&with_frontmatter);
+
+        // Guard the guard: the point of this test is the *nested* anchors
+        // (items/rows are the ones whose inner event ranges slice
+        // `markdown` directly), so make sure `body` still produces some
+        // before comparing — otherwise a future edit to `body` could turn
+        // this into a block-only check that passes vacuously.
+        assert!(without.iter().any(|a| a.kind == AnchorKind::Item));
+        assert!(without.iter().any(|a| a.kind == AnchorKind::Row));
+
+        assert_eq!(without.len(), with.len());
+        for (a, b) in without.iter().zip(with.iter()) {
+            assert_eq!(a.kind, b.kind);
+            assert_eq!(a.parent, b.parent);
+            assert_eq!(a.hash, b.hash);
+            assert_eq!(a.source, b.source);
+            assert_eq!(a.excerpt, b.excerpt);
+            assert_eq!(b.line_start, a.line_start + 3);
+            assert_eq!(b.line_end, a.line_end + 3);
+        }
+    }
+
+    // -- to_html_plain() / anchors_plain(): plain text ---------------------
+
+    #[test]
+    fn to_html_plain_wraps_every_non_blank_line_in_a_block_div() {
+        let html = to_html_plain("first\nsecond\n");
+        assert!(
+            html.contains("<div class=\"blk\" data-kind=\"block\" data-hash=\""),
+            "{html}"
+        );
+        assert_eq!(html.matches("class=\"blk\"").count(), 2, "{html}");
+        assert!(html.contains(">first</div>"), "{html}");
+        assert!(html.contains(">second</div>"), "{html}");
+    }
+
+    #[test]
+    fn to_html_plain_marks_blank_lines_with_a_non_clickable_div() {
+        let html = to_html_plain("a\n\nb\n");
+        assert!(html.contains("<div class=\"blk-blank\"></div>"), "{html}");
+        // The blank-line div must not carry the `blk` class review.js
+        // clicks on: `class="blk-blank"` never matches `class="blk"`.
+        assert_eq!(html.matches("class=\"blk\"").count(), 2, "{html}");
+    }
+
+    #[test]
+    fn to_html_plain_keeps_leading_and_trailing_whitespace_in_the_body() {
+        // The rendered body pushes the *raw* line, not the trimmed one used
+        // for hashing/excerpt — a `.trim_end()` (or any trim) on the body
+        // here would make this fail, silently breaking the "verbatim"
+        // rendering doc comment promises for a non-blank line that carries
+        // leading/trailing whitespace.
+        let html = to_html_plain("    padded    \n");
+        assert!(html.contains(">    padded    </div>"), "{html}");
+    }
+
+    #[test]
+    fn to_html_plain_does_not_interpret_markdown_syntax() {
+        let html = to_html_plain("# Title\n*em*\n- item\n| a | b |\n");
+        assert!(!html.contains("<h1>"), "{html}");
+        assert!(!html.contains("<em>"), "{html}");
+        assert!(!html.contains("<li>"), "{html}");
+        assert!(!html.contains("<table>"), "{html}");
+        assert!(html.contains("># Title</div>"), "{html}");
+        assert!(html.contains(">*em*</div>"), "{html}");
+    }
+
+    #[test]
+    fn to_html_plain_escapes_html_special_characters() {
+        let html = to_html_plain("<script>alert(1)</script>\n& \" '\n");
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(
+            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "{html}"
+        );
+        assert!(html.contains("&amp; &quot; &#39;"), "{html}");
+    }
+
+    #[test]
+    fn to_html_plain_normalizes_crlf_line_endings() {
+        let crlf = to_html_plain("a\r\nb\r\n");
+        let lf = to_html_plain("a\nb\n");
+        assert_eq!(crlf, lf);
+        assert!(!crlf.contains('\r'), "{crlf}");
+    }
+
+    #[test]
+    fn to_html_plain_keeps_tab_characters_as_is() {
+        let html = to_html_plain("\tindented\n");
+        assert!(html.contains(">\tindented</div>"), "{html}");
+    }
+
+    #[test]
+    fn to_html_plain_truncates_data_excerpt_to_eighty_characters() {
+        // Multi-byte characters must be counted, not sliced by byte.
+        let html = to_html_plain(&"日".repeat(100));
+        let expected = format!("data-excerpt=\"{}\"", "日".repeat(80));
+        assert!(html.contains(&expected), "{html}");
+    }
+
+    #[test]
+    fn to_html_plain_wraps_the_whole_output_in_a_plain_div() {
+        let html = to_html_plain("a\n");
+        assert!(html.starts_with("<div class=\"plain\">"), "{html}");
+        assert!(html.trim_end().ends_with("</div>"), "{html}");
+        // An empty document still produces the wrapper, nothing else.
+        let empty = to_html_plain("");
+        assert!(empty.starts_with("<div class=\"plain\">"), "{empty}");
+        assert!(!empty.contains("class=\"blk\""), "{empty}");
+    }
+
+    #[test]
+    fn anchors_plain_hashes_match_to_html_plain_data_hashes() {
+        let text = "first line\n\nsecond line\n\tthird line\n";
+        let expected = anchors_plain(text);
+        let html = to_html_plain(text);
+
+        let found_hashes = block_level_hashes(&html);
+
+        assert_eq!(found_hashes.len(), expected.len());
+        assert_eq!(found_hashes.len(), 3);
+        for (found, anchor) in found_hashes.iter().zip(expected.iter()) {
+            assert_eq!(*found, anchor.hash);
+        }
+    }
+
+    #[test]
+    fn anchors_plain_line_starts_match_to_html_plain_data_line_start() {
+        // Additional to the brief: prove the shared line-walk helper keeps
+        // `data-line-start` and `anchors_plain(..)[i].line_start` in lock
+        // step, not just the hashes checked above.
+        let text = "first line\n\nsecond line\n\tthird line\n";
+        let expected = anchors_plain(text);
+        let html = to_html_plain(text);
+
+        const MARKER: &str = "data-line-start=\"";
+        let found_line_starts: Vec<usize> = html
+            .match_indices(MARKER)
+            .map(|(idx, _)| {
+                let rest = &html[idx + MARKER.len()..];
+                rest[..rest.find('"').expect("closing quote")]
+                    .parse()
+                    .expect("numeric data-line-start")
+            })
+            .collect();
+
+        assert_eq!(found_line_starts.len(), expected.len());
+        assert_eq!(found_line_starts.len(), 3);
+        for (found, anchor) in found_line_starts.iter().zip(expected.iter()) {
+            assert_eq!(*found, anchor.line_start);
+        }
+    }
+
+    #[test]
+    fn anchors_plain_reports_one_based_single_line_ranges() {
+        let anchors = anchors_plain("a\n\nb\n");
+        assert_eq!(anchors.len(), 2);
+        assert_eq!((anchors[0].line_start, anchors[0].line_end), (1, 1));
+        // Blank lines still advance the line counter.
+        assert_eq!((anchors[1].line_start, anchors[1].line_end), (3, 3));
+    }
+
+    #[test]
+    fn anchors_plain_marks_every_anchor_as_a_parentless_block() {
+        let anchors = anchors_plain("a\nb\n");
+        assert!(anchors.iter().all(|a| a.kind == AnchorKind::Block));
+        assert!(anchors.iter().all(|a| a.parent.is_none()));
+    }
+
+    #[test]
+    fn anchors_plain_skips_blank_and_whitespace_only_lines() {
+        let anchors = anchors_plain("a\n\n   \n\t\nb\n");
+        assert_eq!(anchors.len(), 2);
+        assert_eq!(anchors[0].source, "a");
+        assert_eq!(anchors[1].source, "b");
+        // `source`/`excerpt` are trimmed even though the rendered body
+        // keeps the raw indentation.
+        let indented = anchors_plain("    padded    \n");
+        assert_eq!(indented[0].source, "padded");
+        assert_eq!(indented[0].excerpt, "padded");
+    }
+}

@@ -1,0 +1,1111 @@
+:root {
+  --md-bg: #ffffff;
+  --md-fg: #1f2328;
+  --md-muted: #59636e;
+  --md-border: #d1d9e0;
+  --md-code-bg: #f6f8fa;
+  --md-link: #0969da;
+  --md-blockquote-border: #d1d9e0;
+  --md-accent: #0969da;
+  --md-accent-fg: #ffffff;
+  --md-danger: #cf222e;
+  --md-review-bg: #f6f8fa;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --md-bg: #0d1117;
+    --md-fg: #e6edf3;
+    --md-muted: #9198a1;
+    --md-border: #3d444d;
+    --md-code-bg: #151b23;
+    --md-link: #4493f8;
+    --md-blockquote-border: #3d444d;
+    --md-accent: #4493f8;
+    --md-accent-fg: #0d1117;
+    --md-danger: #ff7b72;
+    --md-review-bg: #151b23;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background-color: var(--md-bg);
+  color: var(--md-fg);
+}
+
+.markdown-body {
+  /* rem, not px, so the document's line length scales with zoom too
+     (assets/viewer.js) instead of staying visually the same width while
+     the text inside it grows or shrinks. */
+  max-width: 55rem;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 6rem;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica,
+    Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  /* rem, not px: assets/viewer.js drives zoom by scaling the root <html>
+     element's font-size, and only a relative unit here actually responds
+     to that. */
+  font-size: 1rem;
+  line-height: 1.6;
+  word-wrap: break-word;
+}
+
+/* Reading width, toggled via `data-content-width` on <html> — see
+   assets/viewer.js's `setContentWidth` function and the View menu's
+   Standard/Wide/Full Width items in app.rs's `install_menu`. Left
+   unattributed (standard, 55rem above) covers `--export`'s embedded HTML
+   too, which never loads viewer.js and so never sets the attribute. */
+html[data-content-width="wide"] .markdown-body {
+  max-width: 80rem;
+}
+
+html[data-content-width="full"] .markdown-body {
+  max-width: none;
+}
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+  margin-top: 1.5em;
+  margin-bottom: 0.75em;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.markdown-body h1 {
+  font-size: 2em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--md-border);
+}
+
+.markdown-body h2 {
+  font-size: 1.5em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--md-border);
+}
+
+.markdown-body h3 {
+  font-size: 1.25em;
+}
+
+.markdown-body h4 {
+  font-size: 1em;
+}
+
+.markdown-body h5 {
+  font-size: 0.875em;
+}
+
+.markdown-body h6 {
+  font-size: 0.85em;
+  color: var(--md-muted);
+}
+
+.markdown-body p,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body table,
+.markdown-body blockquote,
+.markdown-body pre,
+.markdown-body .footnote-definition {
+  margin-top: 0;
+  margin-bottom: 1em;
+}
+
+.markdown-body a {
+  color: var(--md-link);
+  text-decoration: none;
+}
+
+.markdown-body a:hover {
+  text-decoration: underline;
+}
+
+.markdown-body ul,
+.markdown-body ol {
+  padding-left: 2em;
+}
+
+.markdown-body li + li {
+  margin-top: 0.25em;
+}
+
+.markdown-body li input[type="checkbox"] {
+  margin-right: 0.4em;
+}
+
+.markdown-body code,
+.markdown-body pre {
+  font-family:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+
+.markdown-body code {
+  background-color: var(--md-code-bg);
+  padding: 0.2em 0.4em;
+  border-radius: 6px;
+}
+
+.markdown-body pre {
+  background-color: var(--md-code-bg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+}
+
+.markdown-body pre code {
+  background-color: transparent;
+  padding: 0;
+  border-radius: 0;
+  font-size: 1em;
+}
+
+.markdown-body blockquote {
+  padding: 0 1em;
+  color: var(--md-muted);
+  border-left: 0.25em solid var(--md-blockquote-border);
+}
+
+.markdown-body blockquote > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body table {
+  width: 100%;
+  border-collapse: collapse;
+  overflow-x: auto;
+  display: block;
+}
+
+.markdown-body table th,
+.markdown-body table td {
+  padding: 0.4em 0.9em;
+  border: 1px solid var(--md-border);
+}
+
+.markdown-body table th {
+  font-weight: 600;
+  background-color: var(--md-code-bg);
+}
+
+.markdown-body table tr:nth-child(2n) {
+  background-color: var(--md-code-bg);
+}
+
+.markdown-body hr {
+  height: 0.25em;
+  margin: 1.5em 0;
+  background-color: var(--md-border);
+  border: 0;
+}
+
+.markdown-body img {
+  max-width: 100%;
+}
+
+.markdown-body .footnote-definition {
+  font-size: 0.9em;
+  color: var(--md-muted);
+}
+
+.markdown-body .footnote-definition-label {
+  margin-right: 0.4em;
+}
+
+/* -- Two-pane review layout (live view only; see render::page) -------- */
+
+.layout {
+  display: flex;
+  align-items: stretch;
+  min-height: 100vh;
+}
+
+.doc-column {
+  /* Takes over `.doc`'s old row-flex sizing — `.doc` (the <main>) now sits
+     inside this column alongside `.doc-header`, rather than being the
+     direct flex child of `.layout` itself. */
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.doc {
+  flex: 1;
+  /* Needed for `overflow-y: auto` to actually scroll within a flex column
+     — without it, a flex item's min-height defaults to its content size,
+     which would grow `.doc-column` (and so the page) instead of scrolling
+     internally. */
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* -- Doc header: back/forward + current path (assets/viewer.js) -------- */
+
+.doc-header {
+  flex: 0 0 auto;
+  /* This is the mechanism that keeps the header visible while scrolling,
+     not a defensive backup: `.layout` only sets `min-height: 100vh`, not a
+     fixed height, so once the document is taller than the viewport it's
+     the *page itself* that grows and scrolls (same reason `.tree`/
+     `.review` are `position: sticky` too) — `.doc`'s own `overflow-y:
+     auto` only ever engages if `.doc-column` is exactly viewport height,
+     which isn't the common case for a document worth scrolling at all. */
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  /* Same band height as `.tree-header`/`.review-header` (2.5rem, in rem so
+     it scales with zoom) so the three headers' bottom borders line up at
+     the same y across the whole window width. */
+  min-height: 2.5rem;
+  padding: 0 0.75rem;
+  border-bottom: 1px solid var(--md-border);
+  background-color: var(--md-bg);
+}
+
+.doc-header-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--md-muted);
+  font-size: 0.8em;
+}
+
+/* -- Shared icon button: doc back/forward + tree/review collapse --------
+   One visual style for `.doc-nav-btn`, `.tree-collapse-btn`, `.review-
+   collapse-btn` — square, chevron-only, no text glyph (glyph rendering for
+   ⟨/⟩/◀/▶ varies by platform font; a CSS-drawn chevron doesn't). Sizes stay
+   in rem/em so zoom (assets/viewer.js sets the root font-size) scales them
+   along with everything else. `.review .icon-btn` is written out
+   explicitly so it beats `.review button`'s (0,1,1) padding/background/
+   border — `.icon-btn` alone (0,1,0) would lose that fight. */
+.icon-btn,
+.review .icon-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  padding: 0;
+  font: inherit;
+  line-height: 1;
+  color: var(--md-muted);
+  background-color: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.icon-btn:hover:not(:disabled),
+.review .icon-btn:hover:not(:disabled) {
+  color: var(--md-fg);
+  background-color: var(--md-review-bg);
+  border-color: var(--md-border);
+}
+
+.icon-btn:disabled,
+.review .icon-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* Chevron, drawn as a rotated corner rather than a text glyph. */
+.icon-btn::before {
+  content: "";
+  width: 0.5rem;
+  height: 0.5rem;
+  border-top: 1.5px solid currentColor;
+  border-right: 1.5px solid currentColor;
+}
+
+.icon-btn.chevron-right::before {
+  transform: translateX(-20%) rotate(45deg);
+}
+
+.icon-btn.chevron-left::before {
+  transform: translateX(20%) rotate(-135deg);
+}
+
+/* Tree header's folder button (PUT /pick-root) — same CSS-drawn-glyph
+   approach as the chevron above (no platform-dependent glyph rendering),
+   just a different shape: an open folder, drawn as two currentColor-
+   bordered rectangles (a narrow "tab" sitting on a wider "body") instead
+   of the chevron's single corner. `position: relative` so the tab
+   (`::after`) can be placed against the button itself rather than
+   whichever ancestor happens to be positioned. `::before`'s `border`
+   shorthand fully replaces the shared rule's `border-top`/`border-right`
+   chevron, so nothing chevron-shaped leaks through here. */
+.icon-btn.tree-folder-btn {
+  position: relative;
+}
+
+.icon-btn.tree-folder-btn::before {
+  width: 0.85rem;
+  height: 0.55rem;
+  border: 1.3px solid currentColor;
+  border-radius: 1px;
+}
+
+.icon-btn.tree-folder-btn::after {
+  content: "";
+  position: absolute;
+  top: calc(50% - 0.37rem);
+  left: calc(50% - 0.42rem);
+  width: 0.4rem;
+  height: 0.18rem;
+  border: 1.3px solid currentColor;
+  border-bottom: none;
+  border-radius: 1px 1px 0 0;
+}
+
+/* `--browser` mode has no window/root concept at all (`PUT /pick-root`
+   always answers `501` there — see routes::handle_pick_root's docs), so
+   the folder button never does anything there either; hidden for the same
+   reason `.doc-nav-btn` is just below. */
+body[data-mode="browser"] .tree-folder-btn {
+  display: none;
+}
+
+/* `--browser` mode has no per-window history at all (`GET`/`PUT /nav`
+   always answer accordingly — see routes::handle's docs), so the nav
+   buttons never do anything there; hide them rather than show permanently-
+   disabled controls. The path label still shows. */
+body[data-mode="browser"] .doc-nav-btn {
+  display: none;
+}
+
+.review {
+  /* Overridden inline (assets/review.js) from the persisted
+     mdview.review.width — this is just the first-paint default. */
+  width: 320px;
+  flex: 0 0 auto;
+  border-left: 1px solid var(--md-border);
+  overflow-y: auto;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  /* No top padding: `.review-header` is `position: sticky; top: 0` inside
+     this scroll container, and a sticky child can't be pulled above its
+     containing block's content edge with a negative margin — the pane's
+     own top padding would push the header band down out of line with
+     `.doc-header`/`.tree-header`. The header's margin-bottom supplies the
+     spacing below the band instead. */
+  padding: 0 1rem 1rem;
+  background-color: var(--md-bg);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica,
+    Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+/* -- Pane splitter and collapse (review.js) ----------------------------- */
+
+.splitter {
+  flex: 0 0 auto;
+  /* rem, not px: keeps a proportionally-sized grab target as zoom scales
+     the rest of the layout (assets/viewer.js) instead of staying a fixed
+     6px regardless of how large everything else has gotten. */
+  width: 0.375rem;
+  cursor: col-resize;
+  background-color: transparent;
+}
+
+.splitter:hover,
+.splitter.dragging {
+  background-color: var(--md-border);
+}
+
+.layout.no-select {
+  user-select: none;
+}
+
+/* `#splitter`/`#tree-splitter` (ids), not the shared `.splitter` class —
+   there are two splitters now (this one, between the doc and the review
+   pane, and the tree pane's own — see the tree-pane section below), and a
+   bare `.splitter` here would hide both whenever either pane collapses. */
+.layout.review-collapsed .review,
+.layout.review-collapsed #splitter {
+  display: none;
+}
+
+/* `.review-collapse-tab` is `position: fixed` at the right edge and takes
+   no space in the flex row, so without this the doc column would run
+   underneath it (clipping the right end of `.doc-header` and any wide
+   content). Reserve exactly the tab's width instead. */
+.layout.review-collapsed {
+  padding-right: 1.75rem;
+}
+
+.review-collapse-tab {
+  position: fixed;
+  top: 0;
+  right: 0;
+  /* rem, not px — see .splitter above. */
+  width: 1.75rem;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4em;
+  border: 0;
+  border-left: 1px solid var(--md-border);
+  background-color: var(--md-bg);
+  color: var(--md-muted);
+  cursor: pointer;
+  writing-mode: vertical-rl;
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  z-index: 10;
+}
+
+.review-collapse-tab:hover {
+  background-color: var(--md-review-bg);
+}
+
+/* -- File tree pane (assets/tree.js) ------------------------------------ */
+
+.tree {
+  /* Overridden inline (assets/tree.js) from the persisted mdview.tree.width
+     — this is just the first-paint default. */
+  width: 240px;
+  flex: 0 0 auto;
+  border-right: 1px solid var(--md-border);
+  overflow-y: auto;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  /* No top padding — same reasoning as `.review`: `.tree-header` is sticky
+     at `top: 0` and must sit flush with the window's top edge. */
+  padding: 0 0.5rem 0.5rem;
+  background-color: var(--md-bg);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica,
+    Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+/* `#tree`/`#tree-splitter` (ids), same reasoning as `.layout.review-
+   collapsed` above — `.tree`'s own splitter must stay put while the review
+   pane collapses (and vice versa), so neither rule can key off the shared
+   `.splitter` class alone. */
+.layout.tree-collapsed .tree,
+.layout.tree-collapsed #tree-splitter {
+  display: none;
+}
+
+/* Same as `.layout.review-collapsed`'s padding-right: `.tree-collapse-tab`
+   is fixed at the left edge, and `.doc-header`'s path label would
+   otherwise sit hidden behind it. */
+.layout.tree-collapsed {
+  padding-left: 1.75rem;
+}
+
+.tree-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  /* Same band height as `.doc-header`/`.review-header` (2.5rem). Negative
+     horizontal margins cancel `.tree`'s own 0.5rem side padding so the
+     border spans the full pane width edge to edge; the padding below
+     re-adds it inside the header, with extra left space to match the
+     other two panes' 0.75rem inner edge. */
+  min-height: 2.5rem;
+  margin: 0 -0.5rem 0.5rem;
+  padding: 0 0.5rem 0 0.75rem;
+  border-bottom: 1px solid var(--md-border);
+  background-color: var(--md-bg);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+
+.tree-root-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--md-muted);
+  font-size: 0.8em;
+  /* Grow into the header's leftover space so the collapse button stays
+     pinned at the pane's inner edge instead of `justify-content: space-
+     between` floating it in the middle. `min-width: 0` because a flex
+     item's default `min-width: auto` floors it at its content width, so
+     the ellipsis would never engage and a long root name would overflow
+     the pane sideways instead. */
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.tree-collapse-tab {
+  position: fixed;
+  top: 0;
+  left: 0;
+  /* rem, not px — see .splitter above. */
+  width: 1.75rem;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4em;
+  border: 0;
+  border-right: 1px solid var(--md-border);
+  background-color: var(--md-bg);
+  color: var(--md-muted);
+  cursor: pointer;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  z-index: 10;
+}
+
+.tree-collapse-tab:hover {
+  background-color: var(--md-review-bg);
+}
+
+.tree-placeholder {
+  color: var(--md-muted);
+  padding: 0.3em 0.4em;
+}
+
+.tree-error {
+  padding: 0.4em 0.6em;
+  margin-bottom: 0.5em;
+  border-radius: 6px;
+  background-color: color-mix(in srgb, var(--md-danger) 15%, var(--md-bg));
+  color: var(--md-danger);
+  font-size: 0.85em;
+}
+
+.tree-truncated {
+  margin-top: 0.4em;
+  padding: 0.3em 0.4em;
+  color: var(--md-muted);
+  font-size: 0.75rem;
+}
+
+.tree-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.tree-item {
+  display: flex;
+  align-items: center;
+  gap: 0.3em;
+  padding: 0.2em 0.4em;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.tree-item:hover {
+  background-color: var(--md-review-bg);
+}
+
+.tree-item.tree-current {
+  background-color: var(--md-review-bg);
+  color: var(--md-accent);
+  font-weight: 600;
+}
+
+.tree-toggle {
+  flex: 0 0 auto;
+  width: 1em;
+  text-align: center;
+  color: var(--md-muted);
+  transition: transform 0.1s ease;
+}
+
+.tree-dir.collapsed .tree-toggle {
+  transform: rotate(-90deg);
+}
+
+.tree-spacer {
+  flex: 0 0 auto;
+  width: 1em;
+}
+
+.tree-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* -- Block markers (.blk wraps every top-level block; data-hash/-count
+   are stamped by render.rs/review.js) ----------------------------------- */
+
+.doc .blk {
+  position: relative;
+  border-radius: 6px;
+  padding: 0.1em 0.6em;
+  margin: 0 -0.6em;
+}
+
+.doc .blk:hover {
+  cursor: pointer;
+  background-color: var(--md-review-bg);
+}
+
+.doc .blk.selected {
+  outline: 2px solid var(--md-accent);
+  outline-offset: -2px;
+  background-color: var(--md-review-bg);
+}
+
+.doc .blk.has-comments {
+  border-left: 3px solid var(--md-accent);
+  padding-left: calc(0.6em - 3px);
+}
+
+.doc .blk.has-comments::after {
+  content: attr(data-count);
+  position: absolute;
+  top: 0.3em;
+  right: 0.3em;
+  min-width: 1.4em;
+  padding: 0 0.35em;
+  border-radius: 999px;
+  background-color: var(--md-accent);
+  color: var(--md-accent-fg);
+  font-size: 0.7rem;
+  font-weight: 600;
+  line-height: 1.4em;
+  text-align: center;
+}
+
+/* -- Plain-text documents (.plain wraps every line; render.rs's
+   to_html_plain) -------------------------------------------------------
+   Deliberately NOT scoped to `.doc`: `render::page` only adds that class
+   for the live view, so a `--export`ed .txt page would otherwise lose its
+   whitespace and monospace formatting. The hover/selected/has-comments
+   styling above stays `.doc`-scoped, since only the live view has a
+   review pane to drive it. */
+
+.plain .blk {
+  white-space: pre-wrap;
+  font-family:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+  tab-size: 4;
+}
+
+.plain .blk-blank {
+  /* One line's worth of height, matching `.markdown-body`'s line-height,
+     so a blank line in the source is a blank line on screen. */
+  min-height: 1.6em;
+}
+
+/* -- Nested anchors: list items / table rows (assets/review.js's
+   `li.anchor`/`tr.anchor`) --------------------------------------------- */
+
+.doc .anchor {
+  position: relative;
+  cursor: pointer;
+}
+
+.doc .anchor:hover {
+  background-color: var(--md-review-bg);
+}
+
+.doc .anchor.selected {
+  outline: 2px solid var(--md-accent);
+  outline-offset: -2px;
+  background-color: var(--md-review-bg);
+}
+
+.doc li.anchor.has-comments {
+  border-left: 3px solid var(--md-accent);
+  padding-left: 0.5em;
+  margin-left: -0.8em;
+}
+
+.doc li.anchor.has-comments::after {
+  content: attr(data-count);
+  position: absolute;
+  top: 0;
+  right: 0;
+  min-width: 1.4em;
+  padding: 0 0.35em;
+  border-radius: 999px;
+  background-color: var(--md-accent);
+  color: var(--md-accent-fg);
+  font-size: 0.7rem;
+  font-weight: 600;
+  line-height: 1.4em;
+  text-align: center;
+}
+
+/* `<tr>` doesn't render `::before`/`::after` generated content in any
+   major browser (a table-row display-type quirk), so a commented row's
+   count badge is rendered on its own *last cell* instead —
+   assets/review.js's applyMarkers() mirrors the row's data-count onto
+   that cell for exactly this reason. The left accent bar, unlike the
+   badge, works fine directly on the row's first cell. */
+.doc tr.anchor.has-comments td:first-child,
+.doc tr.anchor.has-comments th:first-child {
+  border-left: 3px solid var(--md-accent);
+}
+
+.doc tr.anchor.has-comments > :last-child {
+  position: relative;
+}
+
+.doc tr.anchor.has-comments > :last-child[data-count]::after {
+  content: attr(data-count);
+  position: absolute;
+  top: 0.2em;
+  right: 0.2em;
+  min-width: 1.2em;
+  padding: 0 0.3em;
+  border-radius: 999px;
+  background-color: var(--md-accent);
+  color: var(--md-accent-fg);
+  font-size: 0.65rem;
+  font-weight: 600;
+  line-height: 1.3em;
+  text-align: center;
+}
+
+/* "N inside" — a block/item whose nested items/rows carry comments
+   (assets/review.js's countCommentedDescendants()/data-inner-count). Never
+   matches a row (rows have no anchor descendants), and never renders on a
+   `<tr>` even if it did (same generated-content limitation as above). */
+.doc [data-inner-count]::before {
+  content: attr(data-inner-count) " inside";
+  display: inline-block;
+  margin-right: 0.5em;
+  padding: 0.05em 0.5em;
+  border-radius: 999px;
+  background-color: var(--md-review-bg);
+  color: var(--md-muted);
+  font-size: 0.7rem;
+  font-weight: 600;
+  vertical-align: middle;
+}
+
+/* -- Review pane widgets ------------------------------------------------ */
+
+.review-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  /* Same band height as `.doc-header`/`.tree-header` (2.5rem). Negative
+     horizontal margins cancel `.review`'s own 1rem side padding so the
+     border spans the full pane width edge to edge; the padding below
+     re-adds it inside the header, with less left space so the collapse
+     button sits at the pane's inner edge (mirroring the tree pane's
+     collapse button, which sits at its own inner/right edge). No
+     `justify-content: space-between` — order is collapse button, count,
+     save status, then `.review-export` pushed right by its own
+     `margin-left: auto`. */
+  min-height: 2.5rem;
+  margin: 0 -1rem 0.75rem;
+  padding: 0 1rem 0 0.75rem;
+  border-bottom: 1px solid var(--md-border);
+  background-color: var(--md-bg);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+
+.review-count {
+  font-weight: 600;
+}
+
+.review button {
+  font: inherit;
+  color: inherit;
+  background-color: var(--md-review-bg);
+  border: 1px solid var(--md-border);
+  border-radius: 6px;
+  padding: 0.35em 0.75em;
+  cursor: pointer;
+}
+
+.review button:hover {
+  background-color: var(--md-border);
+}
+
+.review button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.review .review-export {
+  /* `.review .review-export`, not a bare `.review-export`: `.review
+     button` (0,1,1) would otherwise beat a lone class (0,1,0) and keep its
+     default padding/font-size here. Pushed to the far right of
+     `.review-header` regardless of how many siblings (count, save status)
+     precede it, and sized down to fit inside the shared 2.5rem band. */
+  margin-left: auto;
+  padding: 0.25em 0.7em;
+  font-size: 0.8125rem;
+  background-color: var(--md-accent);
+  color: var(--md-accent-fg);
+  border-color: var(--md-accent);
+  font-weight: 600;
+}
+
+.review .review-export:hover {
+  filter: brightness(1.1);
+}
+
+.review-banner {
+  padding: 0.5em 0.75em;
+  margin-bottom: 0.75rem;
+  border-radius: 6px;
+  background-color: color-mix(in srgb, var(--md-danger) 15%, var(--md-bg));
+  color: var(--md-danger);
+  font-size: 0.85em;
+}
+
+.review-retry {
+  margin-top: 0.75rem;
+}
+
+.review-save-status {
+  flex: 0 0 auto;
+  font-size: 0.75rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.review-save-status.saving {
+  color: var(--md-muted);
+}
+
+.review-save-status.saved {
+  color: var(--md-accent);
+}
+
+button.review-save-status.failed {
+  padding: 0.2em 0.5em;
+  border-color: var(--md-danger);
+  background-color: color-mix(in srgb, var(--md-danger) 15%, var(--md-bg));
+  color: var(--md-danger);
+}
+
+.review-toast {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5em;
+  padding: 0.5em 0.75em;
+  margin-bottom: 0.75rem;
+  border-radius: 6px;
+  background-color: color-mix(in srgb, var(--md-accent) 15%, var(--md-bg));
+  color: var(--md-fg);
+  font-size: 0.85em;
+}
+
+.review-toast button {
+  font-size: 0.8em;
+  padding: 0.2em 0.5em;
+}
+
+.review-placeholder {
+  color: var(--md-muted);
+}
+
+/* -- Breadcrumb + item/row hints (assets/review.js's buildBreadcrumb()/
+   buildHint(), shown above the selected anchor's quote) ----------------- */
+
+.review-breadcrumb {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3em;
+  margin-bottom: 0.5rem;
+  font-size: 0.8em;
+  color: var(--md-muted);
+}
+
+.review-breadcrumb-sep {
+  color: var(--md-muted);
+}
+
+.review-breadcrumb-current {
+  font-weight: 600;
+  color: var(--md-fg);
+}
+
+.review-breadcrumb-link {
+  font-size: 1em;
+  padding: 0.1em 0.4em;
+}
+
+/* "File" — the breadcrumb's permanent root segment (assets/review.js's
+   buildFileBreadcrumbSegment()) and the file-mode comment list heading. */
+.review-breadcrumb-badge {
+  display: inline-block;
+  margin-left: 0.3em;
+  min-width: 1.2em;
+  padding: 0 0.35em;
+  border-radius: 999px;
+  background-color: var(--md-accent);
+  color: var(--md-accent-fg);
+  font-size: 0.7rem;
+  font-weight: 600;
+  line-height: 1.4em;
+  text-align: center;
+}
+
+.review-file-heading {
+  margin: 0 0 0.5rem;
+  font-size: 0.85em;
+  font-weight: 600;
+}
+
+.review-hint {
+  margin: 0 0 0.6rem;
+  font-size: 0.8em;
+  color: var(--md-muted);
+}
+
+.review-hint-up {
+  display: inline-block;
+  margin: 0 0 0.6rem;
+  font-size: 0.8em;
+}
+
+.review-quote-wrap {
+  margin: 0 0 0.75rem;
+}
+
+.review-line-badge {
+  display: inline-block;
+  margin-bottom: 0.3em;
+  padding: 0.1em 0.55em;
+  border: 1px solid var(--md-border);
+  border-radius: 999px;
+  background-color: var(--md-review-bg);
+  color: var(--md-muted);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.review-quote {
+  margin: 0;
+  padding: 0.4em 0.75em;
+  border-left: 3px solid var(--md-blockquote-border);
+  color: var(--md-muted);
+  font-size: 0.85em;
+  word-wrap: break-word;
+}
+
+.review-comments {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-bottom: 0.75rem;
+}
+
+.review-comment {
+  padding: 0.5em 0.6em;
+  border: 1px solid var(--md-border);
+  border-radius: 6px;
+  background-color: var(--md-review-bg);
+}
+
+.review-comment-text {
+  margin: 0 0 0.4em;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.review-comment-actions,
+.review-unanchored-actions {
+  display: flex;
+  gap: 0.4em;
+}
+
+.review-comment-actions button,
+.review-unanchored-actions button {
+  font-size: 0.8em;
+  padding: 0.2em 0.5em;
+}
+
+.review-textarea {
+  width: 100%;
+  min-height: 5em;
+  resize: vertical;
+  font: inherit;
+  color: inherit;
+  background-color: var(--md-bg);
+  border: 1px solid var(--md-border);
+  border-radius: 6px;
+  padding: 0.5em;
+  margin-bottom: 0.4em;
+}
+
+.review-form {
+  display: flex;
+  flex-direction: column;
+}
+
+.review-unanchored {
+  margin-top: 1rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--md-border);
+}
+
+.review-unanchored-toggle {
+  width: 100%;
+  text-align: left;
+}
+
+.review-unanchored-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-top: 0.6rem;
+}
+
+.review-unanchored-item {
+  padding: 0.5em 0.6em;
+  border: 1px dashed var(--md-border);
+  border-radius: 6px;
+}
+
+.review-unanchored-excerpt {
+  margin: 0 0 0.3em;
+  color: var(--md-muted);
+  font-size: 0.85em;
+}
+
+.review-unanchored-comment {
+  margin: 0 0 0.3em;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+/* -- File mode (assets/review.js's buildFileCommentsView()) -----------
+   `.review-hint.review-file-hint` (rather than relying on source order
+   against the plain `.review-hint` rule above) so this margin-top override
+   wins regardless of where either rule happens to sit in the file. */
+.review-hint.review-file-hint {
+  margin-top: 0.6rem;
+}

@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      # Optional Authenticode signing: only runs when both secrets are
+      # configured on this repo, so a fork PR (which never has secrets) or
+      # this repo before the secrets are set up both silently skip straight
+      # to the unsigned Package step below, unchanged from before.
+      #
+      # The `secrets` context is not allowed inside `if:` expressions (the
+      # workflow would be rejected as invalid), so the secrets are mapped
+      # into step env vars and the condition tests those via a guard step.
+      - name: Check signing secrets
+        id: signing
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $enabled = ($env:WINDOWS_CERT_PFX_BASE64 -ne '' -and $null -ne $env:WINDOWS_CERT_PFX_BASE64 -and $env:WINDOWS_CERT_PASSWORD -ne '' -and $null -ne $env:WINDOWS_CERT_PASSWORD)
+          "enabled=$($enabled.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Sign markdown-remarkable.exe
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "markdown-remarkable-cert.pfx"
+          try {
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+
+            $signtool = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -like "*\x64\signtool.exe" } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if (-not $signtool) {
+              throw "signtool.exe not found under C:\Program Files (x86)\Windows Kits\10\bin"
+            }
+            Write-Host "using $($signtool.FullName)"
+
+            & $signtool.FullName sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $pfxPath /p $env:WINDOWS_CERT_PASSWORD target/release/markdown-remarkable.exe
+            if ($LASTEXITCODE -ne 0) {
+              throw "signtool exited with code $LASTEXITCODE"
+            }
+          } finally {
+            # Always remove the pfx, whether signing succeeded or failed.
+            if (Test-Path $pfxPath) {
+              Remove-Item -Path $pfxPath -Force
+            }
+          }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/release/markdown-remarkable.exe -DestinationPath markdown-remarkable-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: markdown-remarkable-windows-x86_64
+          path: markdown-remarkable-windows-x86_64.zip
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # MACOS_SIGN_IDENTITY, if set, threads a real codesign identity through
+      # to scripts/bundle-macos.sh (as MDVIEW_SIGN_IDENTITY) instead of the
+      # script's default ad-hoc signature. Note this alone isn't enough for
+      # a GitHub-hosted runner: the identity's certificate + private key
+      # also need to be importable from the runner's keychain, which this
+      # workflow doesn't set up (no p12 import/keychain-unlock step here
+      # yet). That's an extension point for later — e.g. a self-hosted
+      # runner with the identity already in its login keychain, or an
+      # additional step here that imports a p12 via `security import`
+      # once a Developer ID certificate is available. Until then, leaving
+      # this secret unset (the default) keeps today's ad-hoc signing
+      # behavior exactly as-is.
+      - name: Build app bundle
+        shell: bash
+        env:
+          MDVIEW_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: scripts/bundle-macos.sh
+
+      - name: Package
+        shell: bash
+        run: ditto -c -k --keepParent target/bundle/markdown-remarkable.app markdown-remarkable-macos-arm64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: markdown-remarkable-macos-arm64
+          path: markdown-remarkable-macos-arm64.zip
+
+  release:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          body: |
+            The Windows build (`markdown-remarkable-windows-x86_64.zip`) requires the Microsoft Edge WebView2 Runtime — preinstalled on Windows 11; if missing, install the [Evergreen Bootstrapper](https://developer.microsoft.com/microsoft-edge/webview2/).
+            The macOS build (`markdown-remarkable-macos-arm64.zip`, Apple Silicon only) is ad-hoc signed, not notarized: on first launch, right-click the app and choose "Open" (or run `xattr -dr com.apple.quarantine markdown-remarkable.app` after unzipping) to get past Gatekeeper.

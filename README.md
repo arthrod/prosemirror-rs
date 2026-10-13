@@ -30,6 +30,28 @@ ProseMirror packages automatically use the Rust implementation.
 - **Advanced** — two side-by-side editors with simulated real-time collaboration
   and tables.
 
+### markdown-remarkable
+
+[`apps/markdown-remarkable`](apps/markdown-remarkable) is a copy of
+[markdown-remarkable](https://github.com/arthrod/markdown-remarkable) at
+`79c75b1`. The viewer, review sidecar, and export are unchanged. The local
+server parses each open file with this crate and applies steps through
+[`editor::Editor`](src/editor.rs):
+
+- `GET /engine` — GFM Markdown (or plain text, one paragraph per line) as a ProseMirror document
+- `POST /engine/steps` — a JSON array of steps, applied in Rust and not written back to the file
+
+The HTML the window shows still comes from remarkable's own renderer, so
+review hashes stay hashes of the source text.
+
+```bash
+cargo test -p remarkable-engine
+cargo run --manifest-path apps/markdown-remarkable/Cargo.toml -- README.md --browser
+```
+
+The viewer crate is excluded from the workspace so `cargo test --all` does not
+need WebKit. `apps/remarkable-engine` is the part CI builds.
+
 ## Quick start
 
 ### Add to your project
