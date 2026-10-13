@@ -4,17 +4,17 @@ use prosemirror_desktop_core::{
 };
 
 #[tauri::command]
-fn engine_info() -> EngineInfo {
+pub fn engine_info() -> EngineInfo {
     info()
 }
 
 #[tauri::command]
-fn self_test() -> Result<SelfTestReport, String> {
+pub fn self_test() -> Result<SelfTestReport, String> {
     run_self_test()
 }
 
 #[tauri::command]
-fn apply_document(
+pub fn apply_document(
     schema_json: String,
     doc_json: String,
     steps_json: String,
