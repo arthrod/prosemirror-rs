@@ -14,7 +14,7 @@ name = "prosemirror_rs_desktop"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.12.3", features = [] }
+tauri-build = { version = "2.7.2", features = [] }
 
 [dependencies]
 prosemirror-desktop-core = { path = "../core" }
