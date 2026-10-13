@@ -22,10 +22,14 @@ npm run build:wasm
 npm run desktop
 ```
 
-Release bundles (deb, AppImage, rpm):
+Release bundle (Debian package). The executable is also written to
+`src-tauri/target/release/prosemirror-rs-desktop`.
 
 ```bash
 npm run desktop:build
 ```
+
+AppImage and rpm bundling are optional (`npx tauri build --bundles appimage`).
+AppImage needs FUSE, which is not available in every build environment.
 
 Requires Rust 1.90+, wasm-pack, and the Tauri system dependencies for your OS.

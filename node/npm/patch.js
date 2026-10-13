@@ -233,17 +233,12 @@ function patchStatics(binding) {
     function PatchedSchema(spec) {
       const specObj = typeof spec === "string" ? JSON.parse(spec) : spec;
       const normalized = normalizeSpec(specObj);
-      let instance;
-      if (typeof spec === "string") {
-        instance = new OrigSchema(spec);
-      } else {
-        // napi accepts objects; wasm accepts strings. Try object first.
-        try {
-          instance = new OrigSchema(normalized);
-        } catch (_) {
-          instance = new OrigSchema(JSON.stringify(normalized));
-        }
-      }
+      // wasm-bindgen's constructor takes a JSON string. Passing the spec
+      // object does not throw — it crashes the webview — so never try it.
+      const wasmBackend = typeof binding.Step_ === "function";
+      const instance = wasmBackend
+        ? new OrigSchema(JSON.stringify(normalized))
+        : new OrigSchema(typeof spec === "string" ? spec : normalized);
       instance.cached = {};
       setRawSpec(instance, specObj);
 
