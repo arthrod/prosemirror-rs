@@ -30,17 +30,6 @@ ProseMirror packages automatically use the Rust implementation.
 - **Advanced** — two side-by-side editors with simulated real-time collaboration
   and tables.
 
-### Writing desk
-
-[`demo/desk`](demo/desk) is a browser writing desk: a file library, a Markdown editor, and review comments stored beside the document the way [markdown-remarkable](https://github.com/arthrod/markdown-remarkable) does. It runs the JavaScript ProseMirror packages this crate implements, so you can use it without a WASM build:
-
-```bash
-cd demo/desk
-npm install
-npm run dev
-```
-
-
 ## Quick start
 
 ### Add to your project
