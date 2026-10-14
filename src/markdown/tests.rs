@@ -645,7 +645,7 @@ fn heading_with_an_image_is_schema_valid() {
 }
 
 #[test]
-fn code_span_newline_serializes_as_a_space() {
+fn code_mark_containing_a_newline_serializes_as_a_fenced_block() {
     let remark = cm();
     let schema = remark.schema();
     let doc = node(
@@ -662,5 +662,14 @@ fn code_span_newline_serializes_as_a_space() {
             }]
         }),
     );
-    assert_eq!(remark.serialize(&doc), "`a b`\n");
+    let serialized = remark.serialize(&doc);
+    assert!(serialized.starts_with("```\n"), "{serialized}");
+    assert!(serialized.contains("a\nb"), "{serialized}");
+    assert!(!serialized.contains("`a"), "{serialized}");
+    let again = remark.parse(&serialized);
+    assert_eq!(again.to_json()["content"][0]["type"], json!("code_block"));
+    assert_eq!(
+        again.to_json()["content"][0]["content"][0]["text"],
+        json!("a\nb")
+    );
 }

@@ -78,12 +78,15 @@ fn handle_request(
         Method::Get | Method::Head | Method::Put | Method::Post => {
             let body = match read_limited_body(&mut request) {
                 Ok(body) => body,
-                Err(BodyTooLarge) => {
+                Err(ReadBodyError::TooLarge) => {
                     return request
                         .respond(
                             Response::from_string("413 Payload Too Large").with_status_code(413),
                         )
                         .context("failed to send 413 response");
+                }
+                Err(ReadBodyError::Io(err)) => {
+                    return Err(err).context("failed to read request body");
                 }
             };
             let headers: Vec<(String, String)> = request
@@ -130,8 +133,13 @@ fn handle_request(
     }
 }
 
-/// Marker error: the request body exceeded [`MAX_BODY_BYTES`].
-struct BodyTooLarge;
+/// A failure while reading the request body. `TooLarge` is answered with
+/// 413; `Io` is returned to the caller instead of being treated as an empty
+/// body (which would be routed as invalid JSON).
+enum ReadBodyError {
+    TooLarge,
+    Io(std::io::Error),
+}
 
 /// Reads `request`'s body, capped at [`MAX_BODY_BYTES`]. `GET`/`HEAD`
 /// requests have no body worth reading, so this always returns `Ok(vec![])`
@@ -141,26 +149,23 @@ struct BodyTooLarge;
 /// was actually read (`take(MAX_BODY_BYTES + 1)`, so a client that lies
 /// about — or omits — its `Content-Length` can't smuggle an unbounded body
 /// past the first check).
-fn read_limited_body(request: &mut Request) -> Result<Vec<u8>, BodyTooLarge> {
+fn read_limited_body(request: &mut Request) -> Result<Vec<u8>, ReadBodyError> {
     if !matches!(request.method(), Method::Put | Method::Post) {
         return Ok(Vec::new());
     }
     if let Some(declared_len) = request.body_length() {
         if declared_len > MAX_BODY_BYTES {
-            return Err(BodyTooLarge);
+            return Err(ReadBodyError::TooLarge);
         }
     }
 
     let mut buffer = Vec::new();
     let mut limited = request.as_reader().take((MAX_BODY_BYTES + 1) as u64);
-    if limited.read_to_end(&mut buffer).is_err() {
-        // Treat a read failure (e.g. the connection dropped mid-body) the
-        // same as an empty body — routes.rs will reject it as invalid JSON
-        // rather than the server panicking or hanging.
-        return Ok(Vec::new());
-    }
+    limited
+        .read_to_end(&mut buffer)
+        .map_err(ReadBodyError::Io)?;
     if buffer.len() > MAX_BODY_BYTES {
-        return Err(BodyTooLarge);
+        return Err(ReadBodyError::TooLarge);
     }
     Ok(buffer)
 }

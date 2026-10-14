@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
 use tempfile::TempDir;
 
 /// Everything a test needs to talk to a running instance of the server.
@@ -47,9 +46,6 @@ fn start_test_server_named(markdown: &str, file_name: &str) -> TestServer {
     thread::spawn(move || {
         let _ = server::run(http_server, &run_path, run_version, false);
     });
-
-    // Give the spawned thread a moment to start accepting connections.
-    thread::sleep(Duration::from_millis(100));
 
     TestServer {
         addr,

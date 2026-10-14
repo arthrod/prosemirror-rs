@@ -171,6 +171,13 @@ fn attach_parent_console() {
 /// reads a file live, per request, rather than once up front) ever tries
 /// to serve it.
 fn confirm_readable(file: &Path) -> Result<()> {
+    let metadata =
+        fs::metadata(file).with_context(|| format!("failed to read {}", file.display()))?;
+    // On Unix, File::open succeeds for a directory. Reject those here so a
+    // directory is never handed to the server as a document.
+    if metadata.is_dir() {
+        anyhow::bail!("failed to read {}: is a directory", file.display());
+    }
     fs::File::open(file)
         .map(|_file| ())
         .with_context(|| format!("failed to read {}", file.display()))

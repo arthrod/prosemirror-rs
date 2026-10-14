@@ -7,6 +7,7 @@
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use pulldown_cmark::{html, Alignment, CowStr, Event, Options, Parser, Tag, TagEnd};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::ops::Range;
 
 /// Bytes left unencoded when percent-encoding a local image's relative path
@@ -193,6 +194,10 @@ pub struct Anchor {
 /// pulldown-cmark's own rendering.
 pub fn to_html(markdown: &str, rewrite_local_images: bool) -> String {
     let mut html_output = String::new();
+    // pulldown-cmark numbers footnotes inside one `push_html` call. This
+    // renderer calls `push_html` once per block (and per leaf run), so the
+    // map has to live for the whole document or later blocks restart at 1.
+    let mut footnotes = HashMap::new();
     for (range, events) in parsed_blocks(markdown) {
         let (line_start, line_end) = line_range(markdown, &range);
         let source = markdown[range].trim();
@@ -246,6 +251,7 @@ pub fn to_html(markdown: &str, rewrite_local_images: bool) -> String {
             None,
             0,
             rewrite_local_images,
+            &mut footnotes,
             &mut html_output,
         );
 
@@ -927,6 +933,7 @@ fn render_events_html(
     alignments: Option<&[Alignment]>,
     depth: u32,
     rewrite_local_images: bool,
+    footnotes: &mut HashMap<String, usize>,
     out: &mut String,
 ) {
     let mut alignment_stack: Vec<Vec<Alignment>> = match alignments {
@@ -959,7 +966,7 @@ fn render_events_html(
             i += 1;
             continue;
         };
-        flush_leaf(events, leaf_start, i, rewrite_local_images, out);
+        flush_leaf(events, leaf_start, i, rewrite_local_images, footnotes, out);
 
         let span = scan_anchor_span(markdown, events, i, kind);
         let inner = &events[i + 1..span.end_idx];
@@ -985,6 +992,7 @@ fn render_events_html(
                     current_alignments,
                     depth + 1,
                     rewrite_local_images,
+                    footnotes,
                     out,
                 );
                 out.push_str("</li>\n");
@@ -999,6 +1007,7 @@ fn render_events_html(
                     current_alignments,
                     is_head,
                     rewrite_local_images,
+                    footnotes,
                     out,
                 );
                 out.push_str("</tr>\n");
@@ -1012,7 +1021,14 @@ fn render_events_html(
         i = span.end_idx + 1;
         leaf_start = i;
     }
-    flush_leaf(events, leaf_start, events.len(), rewrite_local_images, out);
+    flush_leaf(
+        events,
+        leaf_start,
+        events.len(),
+        rewrite_local_images,
+        footnotes,
+        out,
+    );
 }
 
 /// Sanitizes and renders `events[start..end]` (a maximal run of events
@@ -1039,6 +1055,7 @@ fn flush_leaf(
     start: usize,
     end: usize,
     rewrite_local_images: bool,
+    footnotes: &mut HashMap<String, usize>,
     out: &mut String,
 ) {
     if start == end {
@@ -1046,7 +1063,108 @@ fn flush_leaf(
     }
     let slice: Vec<Event<'_>> = events[start..end].iter().map(|(e, _)| e.clone()).collect();
     let sanitized = sanitize_events(slice, rewrite_local_images);
-    html::push_html(out, sanitized.into_iter());
+    let mut piece = String::new();
+    html::push_html(&mut piece, sanitized.into_iter());
+    out.push_str(&apply_footnote_numbers(&piece, footnotes));
+}
+
+/// Rewrites footnote numbers in one `push_html` fragment so they keep
+/// increasing across calls. pulldown-cmark stores that map on `HtmlWriter`,
+/// which is private and starts empty on every `push_html`. The HTML it
+/// emits names the footnote (`href="#…"` / `id="…"`), so the local number
+/// can be replaced with the number from `numbers` (assigned on first sight,
+/// the same rule `HtmlWriter` uses for a single pass).
+fn apply_footnote_numbers(html: &str, numbers: &mut HashMap<String, usize>) -> String {
+    const REFERENCE: &str = "<sup class=\"footnote-reference\"><a href=\"#";
+    const DEFINITION: &str = "<div class=\"footnote-definition\" id=\"";
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while !rest.is_empty() {
+        let reference_at = rest.find(REFERENCE);
+        let definition_at = rest.find(DEFINITION);
+        let (at, definition) = match (reference_at, definition_at) {
+            (Some(reference), Some(definition)) if definition < reference => (definition, true),
+            (Some(reference), _) => (reference, false),
+            (None, Some(definition)) => (definition, true),
+            (None, None) => {
+                out.push_str(rest);
+                break;
+            }
+        };
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let rewritten = if definition {
+            rewrite_footnote_definition(rest, numbers)
+        } else {
+            rewrite_footnote_reference(rest, numbers)
+        };
+        match rewritten {
+            Some((consumed, piece)) => {
+                out.push_str(&piece);
+                rest = &rest[consumed..];
+            }
+            None => {
+                let ch = rest.chars().next().unwrap_or('\0');
+                out.push(ch);
+                rest = &rest[ch.len_utf8()..];
+            }
+        }
+    }
+    out
+}
+
+fn footnote_number(numbers: &mut HashMap<String, usize>, name: &str) -> usize {
+    if let Some(number) = numbers.get(name) {
+        return *number;
+    }
+    let number = numbers.len() + 1;
+    numbers.insert(name.to_string(), number);
+    number
+}
+
+fn rewrite_footnote_reference(
+    html: &str,
+    numbers: &mut HashMap<String, usize>,
+) -> Option<(usize, String)> {
+    const PREFIX: &str = "<sup class=\"footnote-reference\"><a href=\"#";
+    const SUFFIX: &str = "</a></sup>";
+    let after = html.strip_prefix(PREFIX)?;
+    let name_end = after.find('"')?;
+    let name = &after[..name_end];
+    let after_name = after[name_end..].strip_prefix("\">")?;
+    let digits = after_name
+        .bytes()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if digits == 0 || !after_name[digits..].starts_with(SUFFIX) {
+        return None;
+    }
+    let number = footnote_number(numbers, name);
+    let consumed = PREFIX.len() + name.len() + 2 + digits + SUFFIX.len();
+    Some((consumed, format!("{PREFIX}{name}\">{number}{SUFFIX}")))
+}
+
+fn rewrite_footnote_definition(
+    html: &str,
+    numbers: &mut HashMap<String, usize>,
+) -> Option<(usize, String)> {
+    const PREFIX: &str = "<div class=\"footnote-definition\" id=\"";
+    const LABEL: &str = "\"><sup class=\"footnote-definition-label\">";
+    const SUFFIX: &str = "</sup>";
+    let after = html.strip_prefix(PREFIX)?;
+    let name_end = after.find('"')?;
+    let name = &after[..name_end];
+    let after_name = after[name_end..].strip_prefix(LABEL)?;
+    let digits = after_name
+        .bytes()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if digits == 0 || !after_name[digits..].starts_with(SUFFIX) {
+        return None;
+    }
+    let number = footnote_number(numbers, name);
+    let consumed = PREFIX.len() + name.len() + LABEL.len() + digits + SUFFIX.len();
+    Some((consumed, format!("{PREFIX}{name}{LABEL}{number}{SUFFIX}")))
 }
 
 /// Renders a row's `TableCell` children as `<th>`/`<td>` (`is_head` picks
@@ -1064,6 +1182,7 @@ fn render_row_cells(
     alignments: Option<&[Alignment]>,
     is_head: bool,
     rewrite_local_images: bool,
+    footnotes: &mut HashMap<String, usize>,
     out: &mut String,
 ) {
     let tag = if is_head { "th" } else { "td" };
@@ -1085,10 +1204,12 @@ fn render_row_cells(
             _ => out.push('>'),
         }
         let inner: Vec<Event<'_>> = events[i + 1..end].iter().map(|(e, _)| e.clone()).collect();
+        let mut piece = String::new();
         html::push_html(
-            out,
+            &mut piece,
             sanitize_events(inner, rewrite_local_images).into_iter(),
         );
+        out.push_str(&apply_footnote_numbers(&piece, footnotes));
         out.push_str("</");
         out.push_str(tag);
         out.push('>');
@@ -2896,6 +3017,21 @@ final paragraph
         // Limitations).
         assert_to_html_matches_push_html(
             "Body text[^1].\n\n[^1]: A note with a list:\n\n    - point one\n    - point two\n",
+        );
+    }
+
+    #[test]
+    fn footnote_numbers_persist_across_top_level_blocks() {
+        let markdown = "See [^one].\n\n[^one]: First.\n\nAnd [^two].\n\n[^two]: Second.\n";
+        assert_to_html_matches_push_html(markdown);
+        let html = to_html(markdown, false);
+        assert!(
+            html.contains(">1</a></sup>"),
+            "first footnote should be numbered 1: {html}"
+        );
+        assert!(
+            html.contains(">2</a></sup>"),
+            "second footnote should be numbered 2, not restart at 1: {html}"
         );
     }
 

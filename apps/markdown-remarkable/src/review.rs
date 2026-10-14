@@ -146,6 +146,14 @@ pub fn export_path(md: &Path) -> PathBuf {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| md.display().to_string());
+    // `notes.txt.md` stems to `notes.txt`, which is the same export a
+    // plaintext `notes.txt` already uses (`notes.txt.review.md`). Keep the
+    // full file name in that case so the two don't overwrite each other.
+    if crate::util::file_kind(Path::new(&stem)) == Some(FileKind::PlainText) {
+        let mut name = md.as_os_str().to_owned();
+        name.push(".review.md");
+        return PathBuf::from(name);
+    }
     md.with_file_name(format!("{stem}.review.md"))
 }
 
@@ -267,9 +275,13 @@ pub fn validate(doc: &mut ReviewDoc) -> Result<()> {
             doc.version
         ));
     }
+    let mut seen_hashes = HashSet::new();
     for block in &mut doc.blocks {
         if !is_valid_hash(&block.hash) {
             return Err(anyhow!("invalid block hash: {:?}", block.hash));
+        }
+        if !seen_hashes.insert(block.hash.clone()) {
+            return Err(anyhow!("duplicate block hash: {:?}", block.hash));
         }
         normalize_excerpt(&mut block.excerpt);
         validate_comments(&block.comments)?;
@@ -697,6 +709,15 @@ mod tests {
         assert_ne!(md_path, txt_path);
     }
 
+    #[test]
+    fn export_paths_of_notes_txt_and_notes_txt_md_do_not_collide() {
+        let txt_path = export_path(Path::new("/tmp/notes.txt"));
+        let md_path = export_path(Path::new("/tmp/notes.txt.md"));
+        assert_eq!(txt_path, Path::new("/tmp/notes.txt.review.md"));
+        assert_eq!(md_path, Path::new("/tmp/notes.txt.md.review.md"));
+        assert_ne!(txt_path, md_path);
+    }
+
     // -- load / save round-trip -------------------------------------------
 
     #[test]
@@ -927,6 +948,30 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![],
             }],
+            file_comments: Vec::new(),
+        };
+        assert!(validate(&mut doc).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_block_hashes() {
+        let mut doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![
+                ReviewBlock {
+                    hash: "0123456789abcdef".to_string(),
+                    excerpt: "x".to_string(),
+                    kind: AnchorKindDto::Block,
+                    comments: vec![],
+                },
+                ReviewBlock {
+                    hash: "0123456789abcdef".to_string(),
+                    excerpt: "y".to_string(),
+                    kind: AnchorKindDto::Block,
+                    comments: vec![],
+                },
+            ],
             file_comments: Vec::new(),
         };
         assert!(validate(&mut doc).is_err());

@@ -1,5 +1,9 @@
-name: CI
+name: markdown-remarkable CI
 
+# The viewer crate is excluded from the root workspace (it pulls in native
+# GUI dependencies). GitHub only runs workflows from this directory, so the
+# checks that used to live under apps/markdown-remarkable/.github are here
+# and select that crate explicitly.
 on:
   push:
     branches: [main]
@@ -33,14 +37,14 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            apps/markdown-remarkable/target
+          key: ${{ matrix.os }}-markdown-remarkable-${{ hashFiles('**/Cargo.lock') }}
 
       - name: cargo fmt --check
-        run: cargo fmt --all -- --check
+        run: cargo fmt --manifest-path apps/markdown-remarkable/Cargo.toml -p markdown-remarkable -- --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --manifest-path apps/markdown-remarkable/Cargo.toml -p markdown-remarkable --all-targets -- -D warnings
 
       - name: cargo test
-        run: cargo test --locked
+        run: cargo test --manifest-path apps/markdown-remarkable/Cargo.toml -p markdown-remarkable

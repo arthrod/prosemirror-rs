@@ -1,4 +1,4 @@
-name: Release
+name: markdown-remarkable Release
 
 on:
   push:
@@ -19,8 +19,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # The viewer is excluded from the root workspace, so select it
+      # explicitly. Artifacts land under the package directory, not the
+      # workspace target/.
       - name: cargo build --release
-        run: cargo build --release --locked
+        run: cargo build --release --manifest-path apps/markdown-remarkable/Cargo.toml -p markdown-remarkable
 
       # Optional Authenticode signing: only runs when both secrets are
       # configured on this repo, so a fork PR (which never has secrets) or
@@ -59,7 +62,7 @@ jobs:
             }
             Write-Host "using $($signtool.FullName)"
 
-            & $signtool.FullName sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $pfxPath /p $env:WINDOWS_CERT_PASSWORD target/release/markdown-remarkable.exe
+            & $signtool.FullName sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $pfxPath /p $env:WINDOWS_CERT_PASSWORD apps/markdown-remarkable/target/release/markdown-remarkable.exe
             if ($LASTEXITCODE -ne 0) {
               throw "signtool exited with code $LASTEXITCODE"
             }
@@ -73,7 +76,7 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          Compress-Archive -Path target/release/markdown-remarkable.exe -DestinationPath markdown-remarkable-windows-x86_64.zip
+          Compress-Archive -Path apps/markdown-remarkable/target/release/markdown-remarkable.exe -DestinationPath markdown-remarkable-windows-x86_64.zip
 
       - uses: actions/upload-artifact@v4
         with:
@@ -103,11 +106,11 @@ jobs:
         shell: bash
         env:
           MDVIEW_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
-        run: scripts/bundle-macos.sh
+        run: apps/markdown-remarkable/scripts/bundle-macos.sh
 
       - name: Package
         shell: bash
-        run: ditto -c -k --keepParent target/bundle/markdown-remarkable.app markdown-remarkable-macos-arm64.zip
+        run: ditto -c -k --keepParent apps/markdown-remarkable/target/bundle/markdown-remarkable.app markdown-remarkable-macos-arm64.zip
 
       - uses: actions/upload-artifact@v4
         with:

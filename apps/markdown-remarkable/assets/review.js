@@ -46,6 +46,19 @@
     // about GET /review): null | "saving" | "saved" | "failed". Drives the
     // header's Saving…/Saved/"Save failed — retry" indicator.
     saveStatus: null,
+    // New-comment composer text, kept across renderAside redraws for the
+    // anchor it was typed on (selectedHash, or "" for file-level comments).
+    composerDraft: "",
+    composerDraftKey: null,
+    composerFocused: false,
+    composerSelStart: 0,
+    composerSelEnd: 0,
+    // In-progress edit of an existing comment, keyed by that comment's id.
+    editDraft: "",
+    editDraftId: null,
+    editFocused: false,
+    editSelStart: 0,
+    editSelEnd: 0,
   };
 
   var saveStatusTimer = null;
@@ -1050,10 +1063,72 @@
     updateCollapseTabLabel();
   }
 
+  // Anchor key for the new-comment composer: the selected hash, or "" when
+  // the pane is in file mode (no block selected).
+  function composerKey() {
+    return state.selectedHash || "";
+  }
+
+  // renderAside rebuilds the aside from scratch. Snapshot a textarea that
+  // still belongs to the current anchor/comment first, so a redraw (save
+  // status, live reload) does not drop text the user is in the middle of.
+  function captureDrafts() {
+    state.composerFocused = false;
+    state.editFocused = false;
+    if (!asideEl) {
+      return;
+    }
+    var composer = asideEl.querySelector("textarea[data-role='composer']");
+    if (
+      composer &&
+      (state.composerDraftKey === null || state.composerDraftKey === composerKey())
+    ) {
+      state.composerDraft = composer.value;
+      state.composerDraftKey = composerKey();
+      if (document.activeElement === composer) {
+        state.composerFocused = true;
+        state.composerSelStart = composer.selectionStart;
+        state.composerSelEnd = composer.selectionEnd;
+      }
+    }
+    var editor = asideEl.querySelector("textarea[data-role='edit']");
+    if (editor && editor.getAttribute("data-edit-id") === state.editingId) {
+      state.editDraft = editor.value;
+      state.editDraftId = state.editingId;
+      if (document.activeElement === editor) {
+        state.editFocused = true;
+        state.editSelStart = editor.selectionStart;
+        state.editSelEnd = editor.selectionEnd;
+      }
+    }
+  }
+
+  function restoreDraftFocus() {
+    if (!asideEl) {
+      return;
+    }
+    if (state.editFocused) {
+      var editor = asideEl.querySelector("textarea[data-role='edit']");
+      if (editor) {
+        editor.focus();
+        editor.setSelectionRange(state.editSelStart, state.editSelEnd);
+      }
+      return;
+    }
+    if (state.composerFocused) {
+      var composer = asideEl.querySelector("textarea[data-role='composer']");
+      if (composer) {
+        composer.focus();
+        composer.setSelectionRange(state.composerSelStart, state.composerSelEnd);
+      }
+    }
+  }
+
   function renderAside() {
     if (!asideEl) {
       return;
     }
+    captureDrafts();
     clearChildren(asideEl);
 
     if (state.noFileOpen) {
@@ -1138,6 +1213,7 @@
     if (state.loaded) {
       asideEl.appendChild(buildUnanchoredSection());
     }
+    restoreDraftFocus();
   }
 
   // The anchor kind an element identifies itself as (`data-kind`,
@@ -1301,7 +1377,10 @@
 
     if (state.editingId === comment.id) {
       var textarea = el("textarea", "review-textarea");
-      textarea.value = comment.text;
+      textarea.setAttribute("data-role", "edit");
+      textarea.setAttribute("data-edit-id", comment.id);
+      textarea.value =
+        state.editDraftId === comment.id ? state.editDraft : comment.text;
       item.appendChild(textarea);
 
       var actions = el("div", "review-comment-actions");
@@ -1309,6 +1388,8 @@
         var value = textarea.value.trim();
         if (value) {
           state.editingId = null;
+          state.editDraft = "";
+          state.editDraftId = null;
           onSave(comment.id, value);
         }
       };
@@ -1325,6 +1406,10 @@
         if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
           save();
         }
+      });
+      textarea.addEventListener("input", function () {
+        state.editDraft = textarea.value;
+        state.editDraftId = comment.id;
       });
       return item;
     }
@@ -1369,7 +1454,11 @@
   function buildCommentFormView(onSubmit) {
     var form = el("div", "review-form");
     var textarea = el("textarea", "review-textarea");
+    textarea.setAttribute("data-role", "composer");
     textarea.placeholder = "Enter a comment… (Cmd/Ctrl+Enter to save)";
+    if (state.composerDraftKey === composerKey()) {
+      textarea.value = state.composerDraft;
+    }
     form.appendChild(textarea);
 
     var submit = function () {
@@ -1377,7 +1466,8 @@
       if (!value) {
         return;
       }
-      textarea.value = "";
+      state.composerDraft = "";
+      state.composerDraftKey = composerKey();
       onSubmit(value);
     };
     form.appendChild(button("review-save", "Save", submit));
@@ -1386,6 +1476,10 @@
       if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
         submit();
       }
+    });
+    textarea.addEventListener("input", function () {
+      state.composerDraft = textarea.value;
+      state.composerDraftKey = composerKey();
     });
     return form;
   }

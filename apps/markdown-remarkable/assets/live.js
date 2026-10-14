@@ -67,6 +67,9 @@
 
     fetchWithTimeout("/version")
       .then(function (response) {
+        if (!response.ok) {
+          throw new Error("unexpected status " + response.status);
+        }
         return response.text();
       })
       .then(function (version) {

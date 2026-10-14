@@ -1230,19 +1230,15 @@ const TREE_AND_DOC_HEADER_REFRESH_SCRIPT: &str = "\
 /// ordering constraint is about which *intermediate states* become briefly
 /// observable, not about lock nesting/deadlock avoidance.
 ///
-/// Either way, [`WindowCtx::history`] is cleared to `None`: every entry in
-/// it names a path under the *old* root, and `root_dir` is never
-/// recomputed once established except through this very function (see that
-/// field's docs) — so once the boundary itself has just moved, keeping any
-/// of the old entries around would violate "every history entry lives
-/// under the window's current root_dir".
+/// History is cleared only when the open file is dropped. While that file
+/// stays under the new root, its history stays too — clearing it would make
+/// the next switch the first entry, so Back could no longer return here.
 fn reestablish_root(ctx: &mut WindowCtx, picked: PathBuf) {
     let root = canonical_or_given(&picked);
     let stays_open = file_stays_under_root(ctx.canonical_file.as_deref(), &root);
 
     if stays_open {
         set_root_dir(ctx, root);
-        *ctx.history.lock().expect("history mutex poisoned") = None;
         if let Err(err) = ctx
             .webview
             .evaluate_script(TREE_AND_DOC_HEADER_REFRESH_SCRIPT)
@@ -1394,6 +1390,11 @@ fn save_window_state(window: &Window, path: Option<&Path>) {
     let Some(path) = path else {
         return;
     };
+    // Minimizing fires Moved/Resized (often with a 0×0 size). Persisting
+    // that would restore the window minimized, or tiny, on the next launch.
+    if window.is_minimized() {
+        return;
+    }
     let scale = window.scale_factor();
     let position = window
         .outer_position()

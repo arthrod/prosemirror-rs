@@ -37,7 +37,6 @@ pub fn watch(path: &Path, version: Arc<AtomicU64>) -> Result<RecommendedWatcher>
     // through its containing directory. Watch both so neither save strategy
     // loses live reload.
     let target_for_events = target.clone();
-    let parent_for_events = parent.clone();
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
         let event = match result {
             Ok(event) => event,
@@ -52,9 +51,12 @@ pub fn watch(path: &Path, version: Arc<AtomicU64>) -> Result<RecommendedWatcher>
         ) {
             return;
         }
+        // Match the watched file only. An event whose path is just the
+        // parent directory (a sibling create/remove, or a directory
+        // metadata update) is not a change to this file. Canonicalize so a
+        // non-canonical event path still matches the target.
         let touches_target = event.paths.iter().any(|changed| {
             changed == &target_for_events
-                || changed == &parent_for_events
                 || changed.canonicalize().ok().as_ref() == Some(&target_for_events)
         });
         if touches_target {

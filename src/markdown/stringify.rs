@@ -313,9 +313,17 @@ fn escape_text(text: &str, gfm: bool) -> String {
 }
 
 fn render_inline_code(value: &str) -> String {
-    // A raw newline ends the code span. CommonMark turns it into a space.
-    let value = value.replace("\r\n", " ").replace(['\n', '\r'], " ");
-    let value = value.as_str();
+    if value.contains('\n') || value.contains('\r') {
+        // A code span turns an internal newline into a space when CommonMark
+        // reparses it. A fenced block keeps the newline.
+        let fenced = render_block(
+            &Block::Code {
+                value: value.to_string(),
+            },
+            false,
+        );
+        return format!("{fenced}\n");
+    }
     let mut sequence = "`".to_string();
     while fence_occurs(value, &sequence) {
         sequence.push('`');

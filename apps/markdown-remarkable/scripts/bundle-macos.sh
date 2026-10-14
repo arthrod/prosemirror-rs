@@ -36,7 +36,7 @@ case "$(uname -m)" in
   *) echo "error: unsupported architecture $(uname -m)" >&2; exit 1 ;;
 esac
 
-cargo build --release --locked --target "$TARGET"
+cargo build --release -p markdown-remarkable --target "$TARGET"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
