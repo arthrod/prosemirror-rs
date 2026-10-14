@@ -5,7 +5,9 @@ use prosemirror_desktop_core::{
 
 #[tauri::command]
 pub fn engine_info() -> EngineInfo {
-    info()
+    let mut info = info();
+    info.tauri = tauri::VERSION;
+    info
 }
 
 #[tauri::command]

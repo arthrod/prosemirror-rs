@@ -28,8 +28,6 @@ const advancedRoot = document.querySelector("#advanced-root");
 const basicButton = document.querySelector("#mode-basic");
 const advancedButton = document.querySelector("#mode-advanced");
 
-let stop = () => {};
-
 function mountBasic() {
   const host = document.createElement("div");
   host.id = "editor";
@@ -114,7 +112,7 @@ function mountAdvanced() {
       const item = stepsQueue.shift();
       for (const entry of views) {
         if (entry.label === item.from) continue;
-        let tr = entry.view.state.tr;
+        let tr = entry.view.state.tr.setMeta("addToHistory", false);
         let modified = false;
         for (const step of item.steps) {
           const mapped = step.map(tr.mapping);
@@ -141,17 +139,17 @@ function mountAdvanced() {
 }
 
 function show(mode) {
-  stop();
   const advanced = mode === "advanced";
   basicRoot.hidden = advanced;
   advancedRoot.hidden = !advanced;
   basicButton.classList.toggle("is-on", !advanced);
   advancedButton.classList.toggle("is-on", advanced);
-  basicButton.setAttribute("aria-selected", String(!advanced));
-  advancedButton.setAttribute("aria-selected", String(advanced));
-  stop = advanced ? mountAdvanced() : mountBasic();
+  basicButton.setAttribute("aria-pressed", String(!advanced));
+  advancedButton.setAttribute("aria-pressed", String(advanced));
 }
 
+mountBasic();
+mountAdvanced();
 basicButton.addEventListener("click", () => show("basic"));
 advancedButton.addEventListener("click", () => show("advanced"));
 show("basic");
@@ -161,9 +159,9 @@ engine.textContent = wasmNote;
 
 if ("__TAURI_INTERNALS__" in window) {
   import("@tauri-apps/api/core")
-    .then(({ invoke }) => invoke("self_test"))
-    .then((report) => {
-      engine.textContent = `prosemirror-rs ${"0.5.2"} inside Tauri 2.12.3. ${report.passed.length} native engine checks passed.`;
+    .then(({ invoke }) => Promise.all([invoke("engine_info"), invoke("self_test")]))
+    .then(([info, report]) => {
+      engine.textContent = `${info.name} ${info.version} inside Tauri ${info.tauri}. ${report.passed.length} native engine checks passed.`;
     })
     .catch((err) => {
       engine.textContent = err instanceof Error ? err.message : "Native engine check failed";

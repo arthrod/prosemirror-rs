@@ -11,8 +11,7 @@ use prosemirror::transform::{Mapping, Mappable, Step, StepMap};
 use serde::Serialize;
 
 pub const ENGINE_NAME: &str = "prosemirror-rs";
-pub const ENGINE_VERSION: &str = "0.5.2";
-pub const TAURI_VERSION: &str = "2.12.3";
+pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const SCHEMA: &str = r#"{
   "nodes": {
@@ -103,7 +102,7 @@ pub fn engine_info() -> EngineInfo {
     EngineInfo {
         name: ENGINE_NAME,
         version: ENGINE_VERSION,
-        tauri: TAURI_VERSION,
+        tauri: "",
     }
 }
 
@@ -297,8 +296,8 @@ mod tests {
     fn engine_reports_the_crate_version() {
         let info = engine_info();
         assert_eq!(info.name, "prosemirror-rs");
-        assert_eq!(info.version, "0.5.2");
-        assert_eq!(info.tauri, "2.12.3");
+        assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+        assert!(info.tauri.is_empty());
     }
 
     #[test]

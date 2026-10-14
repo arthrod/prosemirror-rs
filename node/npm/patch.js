@@ -32,7 +32,7 @@ function findSpecByMarkTypeName(name) {
   return null;
 }
 
-function patchStatics(binding) {
+function patchStatics(binding, options) {
   const { Fragment: NativeFragment, Slice, Node, Schema, NodeType, MarkType, Mark, ContentMatch } = binding;
 
   // -- WASM snake_case → camelCase aliases for class exports ----------------
@@ -233,9 +233,10 @@ function patchStatics(binding) {
     function PatchedSchema(spec) {
       const specObj = typeof spec === "string" ? JSON.parse(spec) : spec;
       const normalized = normalizeSpec(specObj);
-      // wasm-bindgen's constructor takes a JSON string. Passing the spec
-      // object does not throw — it crashes the webview — so never try it.
-      const wasmBackend = typeof binding.Step_ === "function";
+      // Callers pass { wasm: true }. Step_ exists on both backends, so it
+      // cannot be used to decide. Native Schema accepts an object; wasm-bindgen
+      // crashes the webview unless the spec is a JSON string.
+      const wasmBackend = !!(options && options.wasm);
       const instance = wasmBackend
         ? new OrigSchema(JSON.stringify(normalized))
         : new OrigSchema(typeof spec === "string" ? spec : normalized);

@@ -8,7 +8,7 @@ import * as dom from "./dom-bridge.js";
 await init();
 
 const binding = { ...wasmModule };
-patch.patchStatics(binding);
+patch.patchStatics(binding, { wasm: true });
 const domTypes = dom.createDOMTypes(binding);
 
 export const Schema = binding.Schema;
