@@ -30,6 +30,19 @@ ProseMirror packages automatically use the Rust implementation.
 - **Advanced** — two side-by-side editors with simulated real-time collaboration
   and tables.
 
+### Desktop
+
+[`desktop/`](desktop) is the same two editors as a [Tauri 2.12](https://v2.tauri.app/)
+executable. The webview aliases `prosemirror-model` and `prosemirror-transform`
+to the Rust WebAssembly build, and the native process links this crate directly.
+
+```bash
+cd desktop
+npm install
+npm run build:wasm
+npm run desktop
+```
+
 ## Quick start
 
 ### Add to your project

@@ -7,7 +7,7 @@ const wasm = require("./prosemirror_rs_wasm.js");
 
 // Apply JS-side patches (same as napi/index.js)
 const patch = require("../patch.js");
-patch.patchStatics(wasm);
+patch.patchStatics(wasm, { wasm: true });
 
 // Merge DOM types
 const dom = require("../dom.js");
