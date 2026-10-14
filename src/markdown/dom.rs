@@ -243,48 +243,50 @@ pub fn parse_dom(schema: &DynamicSchema, dom: &DomNode) -> Result<DynamicNode, S
 
 fn parse_blocks(schema: &DynamicSchema, nodes: &[DomNode]) -> Result<Vec<DynamicNode>, String> {
     let mut out = Vec::new();
-    let mut inline: Vec<DynamicNode> = Vec::new();
-    let flush = |inline: &mut Vec<DynamicNode>, out: &mut Vec<DynamicNode>| -> Result<(), String> {
-        if inline.is_empty() {
-            return Ok(());
-        }
-        let nodes = std::mem::take(inline);
-        let nodes = normalize_normal_whitespace(nodes);
-        let frag = Fragment::from_array(nodes);
-        out.push(
-            schema
-                .node("paragraph", json!({}), frag, MarkSet::new())
-                .map_err(|e| e.to_string())?,
-        );
-        Ok(())
-    };
+    let mut inline = Vec::new();
+    absorb(schema, nodes, &mut inline, &mut out)?;
+    flush_inline(schema, &mut inline, &mut out)?;
+    Ok(out)
+}
+
+fn flush_inline(
+    schema: &DynamicSchema,
+    inline: &mut Vec<DynamicNode>,
+    out: &mut Vec<DynamicNode>,
+) -> Result<(), String> {
+    if inline.is_empty() {
+        return Ok(());
+    }
+    let nodes = std::mem::take(inline);
+    let nodes = normalize_normal_whitespace(nodes);
+    let frag = Fragment::from_array(nodes);
+    out.push(
+        schema
+            .node("paragraph", json!({}), frag, MarkSet::new())
+            .map_err(|e| e.to_string())?,
+    );
+    Ok(())
+}
+
+/// Transparent wrappers (`div`, `section`, …) share this block context.
+/// A real `p` stays its own paragraph; loose inlines still join the run.
+fn absorb(
+    schema: &DynamicSchema,
+    nodes: &[DomNode],
+    inline: &mut Vec<DynamicNode>,
+    out: &mut Vec<DynamicNode>,
+) -> Result<(), String> {
     for node in nodes {
         match classify(schema, node)? {
             Parsed::Block(block) => {
-                flush(&mut inline, &mut out)?;
+                flush_inline(schema, inline, out)?;
                 out.push(block);
             }
             Parsed::Inlines(nodes) => inline.extend(nodes),
-            Parsed::Transparent(children) => {
-                // Could be a mix; parse them in this same block context.
-                let nested = parse_blocks(schema, &children)?;
-                for child in nested {
-                    if child.is_block() && child.type_name != "paragraph" {
-                        flush(&mut inline, &mut out)?;
-                        out.push(child);
-                    } else if child.type_name == "paragraph" {
-                        if let Some(content) = child.content() {
-                            inline.extend(content.children().iter().cloned());
-                        }
-                    } else {
-                        inline.push(child);
-                    }
-                }
-            }
+            Parsed::Transparent(children) => absorb(schema, &children, inline, out)?,
         }
     }
-    flush(&mut inline, &mut out)?;
-    Ok(out)
+    Ok(())
 }
 
 enum Parsed {
@@ -406,10 +408,19 @@ fn classify(schema: &DynamicSchema, node: &DomNode) -> Result<Parsed, String> {
             ));
         }
         "li" => {
-            // A bare `li` is wrapped by the caller when it is a list child.
-            // At the top level, treat it as a list of one item.
+            // A list parses its own items. A bare `li` would otherwise sit
+            // directly under `doc`, which only allows blocks.
             let item = parse_list_item(schema, el)?;
-            return Ok(Parsed::Block(item));
+            return Ok(Parsed::Block(
+                schema
+                    .node(
+                        "bullet_list",
+                        json!({ "spread": false }),
+                        Fragment::from(vec![item]),
+                        MarkSet::new(),
+                    )
+                    .map_err(|e| e.to_string())?,
+            ));
         }
         "strong" | "b" | "em" | "i" | "code" | "s" | "del" | "a" | "span" => {
             return Ok(Parsed::Inlines(parse_inlines(
@@ -440,8 +451,12 @@ fn parse_list_items(
 }
 
 fn parse_list_item(schema: &DynamicSchema, el: &DomElement) -> Result<DynamicNode, String> {
-    // Priority 60: a checkbox makes this a task item. Otherwise a regular item.
-    if let Some(checked) = task_checkbox_checked(el) {
+    // A checkbox is a task item only when the schema has that node.
+    // CommonMark has no `task_list_item`; the `li` stays a regular item.
+    let checked = schema
+        .node_type("task_list_item")
+        .and_then(|_| task_checkbox_checked(el));
+    if let Some(checked) = checked {
         let spread = attr(el, "data-spread").as_deref() == Some("true");
         let content_el = el.children.iter().find_map(|n| match n {
             DomNode::Element(child)
@@ -551,9 +566,11 @@ fn parse_inlines(
             }
             DomNode::Element(el) => {
                 let tag = el.tag.to_ascii_lowercase();
-                if let Some(mark) = mark_for(schema, el, &tag) {
+                if let Some(marks_here) = mark_for(schema, el, &tag) {
                     let mut next = marks.clone();
-                    next.add(&mark);
+                    for mark in &marks_here {
+                        next.add(mark);
+                    }
                     out.extend(parse_inlines(schema, &el.children, &next)?);
                     continue;
                 }
@@ -592,7 +609,7 @@ fn parse_inlines(
     Ok(out)
 }
 
-fn mark_for(schema: &DynamicSchema, el: &DomElement, tag: &str) -> Option<DynamicMark> {
+fn mark_for(schema: &DynamicSchema, el: &DomElement, tag: &str) -> Option<Vec<DynamicMark>> {
     let name = match tag {
         "strong" | "b" => "strong",
         "em" | "i" => "em",
@@ -605,22 +622,23 @@ fn mark_for(schema: &DynamicSchema, el: &DomElement, tag: &str) -> Option<Dynami
     schema.mark_type(name)?;
     if name == "link" {
         let href = attr(el, "href")?;
-        return Some(DynamicMark {
+        return Some(vec![DynamicMark {
             type_name: "link".into(),
             attrs: json!({ "href": href, "title": attr(el, "title") }),
-        });
+        }]);
     }
-    Some(DynamicMark {
+    Some(vec![DynamicMark {
         type_name: name.into(),
         attrs: json!({}),
-    })
+    }])
 }
 
-fn mark_from_style(schema: &DynamicSchema, el: &DomElement) -> Option<DynamicMark> {
+fn mark_from_style(schema: &DynamicSchema, el: &DomElement) -> Option<Vec<DynamicMark>> {
     let style = attr(el, "style")?;
+    let mut marks = Vec::new();
     if let Some(weight) = style_value(&style, "font-weight") {
         if schema.mark_type("strong").is_some() && font_weight_is_bold(weight) {
-            return Some(DynamicMark {
+            marks.push(DynamicMark {
                 type_name: "strong".into(),
                 attrs: json!({}),
             });
@@ -628,7 +646,7 @@ fn mark_from_style(schema: &DynamicSchema, el: &DomElement) -> Option<DynamicMar
     }
     if let Some(font) = style_value(&style, "font-style") {
         if schema.mark_type("em").is_some() && font == "italic" {
-            return Some(DynamicMark {
+            marks.push(DynamicMark {
                 type_name: "em".into(),
                 attrs: json!({}),
             });
@@ -636,13 +654,17 @@ fn mark_from_style(schema: &DynamicSchema, el: &DomElement) -> Option<DynamicMar
     }
     if let Some(deco) = style_value(&style, "text-decoration") {
         if schema.mark_type("strikethrough").is_some() && has_line_through(deco) {
-            return Some(DynamicMark {
+            marks.push(DynamicMark {
                 type_name: "strikethrough".into(),
                 attrs: json!({}),
             });
         }
     }
-    None
+    if marks.is_empty() {
+        None
+    } else {
+        Some(marks)
+    }
 }
 
 fn font_weight_is_bold(value: &str) -> bool {
@@ -662,9 +684,10 @@ fn has_line_through(value: &str) -> bool {
 
 fn style_value<'a>(style: &'a str, name: &str) -> Option<&'a str> {
     for decl in style.split(';') {
-        let mut parts = decl.splitn(2, ':');
-        let key = parts.next()?.trim();
-        let value = parts.next()?.trim();
+        let Some((key, value)) = decl.split_once(':') else {
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim());
         if key.eq_ignore_ascii_case(name) {
             return Some(value);
         }

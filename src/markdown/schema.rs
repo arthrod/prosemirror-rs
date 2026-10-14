@@ -4,7 +4,8 @@
 //! the first block is `paragraph` and mark rank is `link`, `code`, `em`,
 //! `strong`, then (GFM) `strikethrough`. That rank is what makes a link wrap
 //! other marks when they cover the same text, and what makes `***text***`
-//! serialize with emphasis outside strong.
+//! serialize with emphasis outside strong. Headings take `inline*` content,
+//! so an image or a hard break in a heading stays a valid document.
 
 use crate::dynamic::DynamicSchema;
 
@@ -32,7 +33,7 @@ pub fn schema_for(flavor: Flavor) -> DynamicSchema {
         },
         "heading": {
             "attrs": { "level": { "default": 1 } },
-            "content": "text*",
+            "content": "inline*",
             "defining": true,
             "group": "block"
         },

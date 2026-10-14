@@ -462,3 +462,76 @@ fn dom_round_trip_and_parse_rules() {
     ));
     assert_eq!(ordered["content"][0]["attrs"]["start"], json!(5));
 }
+
+#[test]
+fn a_div_keeps_paragraph_boundaries() {
+    let json = parsed_json(&el(
+        "div",
+        &[],
+        vec![el("p", &[], vec![text("a")]), el("p", &[], vec![text("b")])],
+    ));
+    assert_eq!(block_types(&json), ["paragraph", "paragraph"]);
+    assert_eq!(json["content"][0]["content"][0]["text"], json!("a"));
+    assert_eq!(json["content"][1]["content"][0]["text"], json!("b"));
+}
+
+#[test]
+fn a_bare_list_item_is_wrapped_in_a_list() {
+    let json = parsed_json(&el("li", &[], vec![el("p", &[], vec![text("a")])]));
+    assert_eq!(block_types(&json), ["bullet_list"]);
+    assert_eq!(
+        json["content"][0]["content"][0]["type"],
+        json!("regular_list_item")
+    );
+}
+
+#[test]
+fn commonmark_ignores_a_task_checkbox() {
+    let editor = cm();
+    let dom = el(
+        "ul",
+        &[],
+        vec![el(
+            "li",
+            &[],
+            vec![
+                el(
+                    "input",
+                    &[("type", "checkbox"), ("checked", "checked")],
+                    vec![],
+                ),
+                text(" a"),
+            ],
+        )],
+    );
+    let doc = parse_dom(editor.schema(), &dom).expect("dom");
+    let json = editor.schema().with_types(|| doc.to_json(true));
+    assert_eq!(
+        json["content"][0]["content"][0]["type"],
+        json!("regular_list_item")
+    );
+}
+
+#[test]
+fn a_span_can_carry_bold_and_italic_together() {
+    let json = parsed_json(&el(
+        "p",
+        &[],
+        vec![el(
+            "span",
+            &[("style", "; font-weight: bold; font-style: italic")],
+            vec![text("Hi")],
+        )],
+    ));
+    let marks = json["content"][0]["content"][0]["marks"]
+        .as_array()
+        .expect("marks");
+    let mut names: Vec<&str> = marks.iter().filter_map(|m| m["type"].as_str()).collect();
+    names.sort();
+    assert_eq!(names, ["em", "strong"]);
+}
+
+#[test]
+fn emphasis_after_an_emoji_does_not_eat_the_emoji() {
+    assert_eq!(type_md(&gfm(), "😀*Test*x"), "😀*Test*x\n");
+}

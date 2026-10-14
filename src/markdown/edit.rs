@@ -827,7 +827,10 @@ fn mark_rule(
     hit: &MarkHit,
     mark_name: &str,
 ) -> Option<DocState> {
-    let start = cursor - (hit.full_chars - inserted.chars().count());
+    if hit.content.contains('\u{fffc}') {
+        return None;
+    }
+    let start = cursor - (hit.full_chars - inserted.encode_utf16().count());
     let end = cursor;
     let mut session = Session::new(&editor.schema, state);
     let doc = session.doc().clone();
@@ -844,8 +847,11 @@ fn mark_rule(
         .and_then(|n| n.marks())
         .cloned()
         .unwrap_or_default();
-    let mut mark_names: Vec<String> = existing.iter().map(|m| m.type_name.clone()).collect();
-    mark_names.push(mark_name.to_string());
+    let mut marks: Vec<DynamicMark> = existing.iter().cloned().collect();
+    marks.push(DynamicMark {
+        type_name: mark_name.to_string(),
+        attrs: json!({}),
+    });
     let text = DynamicNode::text(&hit.content);
     session
         .tr
@@ -853,18 +859,11 @@ fn mark_rule(
     session.sync();
     let from = session.tr.mapping.map(start, 1);
     let to = session.tr.mapping.map(end, 1);
-    for name in &mark_names {
-        let mark = DynamicMark {
-            type_name: name.clone(),
-            attrs: json!({}),
-        };
+    for mark in marks {
         session.tr.add_mark(from, to, mark);
     }
     session.sync();
-    let mut stored = marks_at(&session.tr.doc, session.sel.head);
-    for name in &mark_names {
-        stored = remove_mark_name(stored, name);
-    }
+    let stored = remove_mark_name(marks_at(&session.tr.doc, session.sel.head), mark_name);
     session.stored = Some(stored);
     if !hit.trailing.is_empty() && hit.trailing != "\n" {
         replace_with_text(&mut session, &hit.trailing);
@@ -2148,7 +2147,9 @@ fn wrap_match(
         if behind_ok(before) {
             let content = &inner[idx + open.len()..];
             if content_ok(content) {
-                let full_chars = inner[idx..].chars().count() + close.chars().count() + 1;
+                let full_chars = inner[idx..].encode_utf16().count()
+                    + close.encode_utf16().count()
+                    + trailing.len_utf16();
                 return Some(MarkHit {
                     content: content.to_string(),
                     trailing: trailing.to_string(),
@@ -2281,8 +2282,8 @@ fn find_text(doc: &DynamicNode, needle: &str) -> Option<usize> {
             }
             if let Some(text) = node.text_node() {
                 if let Some(byte) = text.text.as_str().find(needle) {
-                    let chars = text.text.as_str()[..byte].chars().count();
-                    found = Some(pos + chars);
+                    let units = text.text.as_str()[..byte].encode_utf16().count();
+                    found = Some(pos + units);
                     return false;
                 }
             }
