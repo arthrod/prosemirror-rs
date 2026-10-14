@@ -1,0 +1,115 @@
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif;
+  line-height: 1.6;
+  margin: 0;
+  padding: 2rem;
+  background: #f5f5f5;
+}
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  background: #fff;
+  padding: 2rem;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+h1 {
+  margin-top: 0;
+  font-size: 1.5rem;
+  color: #333;
+}
+
+#blurb,
+#engine {
+  color: #555;
+}
+
+.modes {
+  display: flex;
+  gap: 0.5rem;
+  margin: 1rem 0;
+}
+
+.modes button {
+  min-height: 2.25rem;
+  border: 1px solid #ddd;
+  border-radius: 999px;
+  background: #fff;
+  padding: 0 0.9rem;
+  cursor: pointer;
+}
+
+.modes button.is-on {
+  background: #333;
+  color: #fff;
+  border-color: #333;
+}
+
+#editor,
+#editor-a,
+#editor-b {
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  min-height: 220px;
+  padding: 1rem;
+  background: #fafafa;
+}
+
+.editors {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  margin: 1rem 0;
+}
+
+@media (max-width: 800px) {
+  body {
+    padding: 0.75rem;
+  }
+  .container {
+    padding: 1rem;
+  }
+  .editors {
+    grid-template-columns: 1fr;
+  }
+}
+
+.editor-pane h2 {
+  font-size: 1.1rem;
+  margin: 0 0 0.5rem;
+  color: #555;
+}
+
+.ProseMirror {
+  outline: none;
+  background: #fff;
+  min-height: 200px;
+}
+
+.ProseMirror p {
+  margin: 0.5em 0;
+}
+
+.ProseMirror table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.5em 0;
+}
+
+.ProseMirror td,
+.ProseMirror th {
+  border: 1px solid #ddd;
+  padding: 0.4em 0.6em;
+  vertical-align: top;
+}
+
+#status {
+  margin-top: 1rem;
+  padding: 0.75rem;
+  background: #e8f5e9;
+  border-radius: 4px;
+  font-size: 0.9rem;
+  color: #2e7d32;
+}

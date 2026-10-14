@@ -1,0 +1,27 @@
+[workspace]
+
+[package]
+name = "prosemirror-rs-desktop"
+version = "0.5.2"
+description = "prosemirror-rs desktop editor"
+authors = ["prosemirror-rs contributors"]
+edition = "2021"
+license = "MIT"
+rust-version = "1.90"
+
+[lib]
+name = "prosemirror_rs_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7.2", features = [] }
+
+[dependencies]
+prosemirror-desktop-core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2.12.3", features = [] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

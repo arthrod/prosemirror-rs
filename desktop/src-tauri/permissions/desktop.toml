@@ -1,0 +1,14 @@
+[[permission]]
+identifier = "allow-engine-info"
+description = "Read the native engine name and version."
+commands.allow = ["engine_info"]
+
+[[permission]]
+identifier = "allow-self-test"
+description = "Run the native document engine self-test."
+commands.allow = ["self_test"]
+
+[[permission]]
+identifier = "allow-apply-document"
+description = "Apply ProseMirror steps with the native engine."
+commands.allow = ["apply_document"]
