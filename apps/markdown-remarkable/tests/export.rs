@@ -1,0 +1,291 @@
+//! CLI-level integration tests for `--export`, run against the actual
+//! compiled `markdown-remarkable` binary (`CARGO_BIN_EXE_markdown-remarkable`) rather than calling
+//! library functions directly, since the self-overwrite guard and the
+//! `--export`/`--port`/`--no-open` conflict are both `main.rs` concerns.
+
+use std::process::Command;
+
+#[test]
+fn refuses_to_export_over_the_input_file() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file_path = dir.path().join("doc.md");
+    let original_content = "# Original\n";
+    std::fs::write(&file_path, original_content).expect("write markdown file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
+        .arg(&file_path)
+        .arg("--export")
+        .arg(&file_path)
+        .output()
+        .expect("run markdown-remarkable");
+
+    assert!(
+        !output.status.success(),
+        "expected a non-zero exit when --export targets the input file, got: {:?}",
+        output.status
+    );
+
+    let content_after =
+        std::fs::read_to_string(&file_path).expect("read markdown file after the export attempt");
+    assert_eq!(
+        content_after, original_content,
+        "input file was modified despite the self-overwrite guard"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn refuses_to_export_over_a_symlink_to_the_input_file() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file_path = dir.path().join("doc.md");
+    let original_content = "# Original\n";
+    std::fs::write(&file_path, original_content).expect("write markdown file");
+
+    let symlink_path = dir.path().join("alias.md");
+    std::os::unix::fs::symlink(&file_path, &symlink_path).expect("create symlink to input file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
+        .arg(&file_path)
+        .arg("--export")
+        .arg(&symlink_path)
+        .output()
+        .expect("run markdown-remarkable");
+
+    assert!(
+        !output.status.success(),
+        "expected a non-zero exit when --export targets a symlink to the input file, got: {:?}",
+        output.status
+    );
+
+    let content_after =
+        std::fs::read_to_string(&file_path).expect("read markdown file after the export attempt");
+    assert_eq!(
+        content_after, original_content,
+        "input file was modified despite the symlink self-overwrite guard"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn refuses_to_export_over_a_hard_link_to_the_input_file() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file_path = dir.path().join("doc.md");
+    let original_content = "# Original\n";
+    std::fs::write(&file_path, original_content).expect("write markdown file");
+
+    // A hard link is a different path with no resolvable symlink target —
+    // `canonicalize` alone can't tell it apart from an unrelated file, only
+    // the (dev, ino) comparison can.
+    let hardlink_path = dir.path().join("hardlink.md");
+    std::fs::hard_link(&file_path, &hardlink_path).expect("create hard link to input file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
+        .arg(&file_path)
+        .arg("--export")
+        .arg(&hardlink_path)
+        .output()
+        .expect("run markdown-remarkable");
+
+    assert!(
+        !output.status.success(),
+        "expected a non-zero exit when --export targets a hard link to the input file, got: {:?}",
+        output.status
+    );
+
+    let content_after =
+        std::fs::read_to_string(&file_path).expect("read markdown file after the export attempt");
+    assert_eq!(
+        content_after, original_content,
+        "input file was modified despite the hard-link self-overwrite guard"
+    );
+}
+
+#[test]
+fn refuses_to_export_when_the_output_directory_does_not_exist() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let input_path = dir.path().join("doc.md");
+    std::fs::write(&input_path, "# Hello\n").expect("write markdown file");
+
+    let output_path = dir.path().join("no-such-subdir").join("out.html");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
+        .arg(&input_path)
+        .arg("--export")
+        .arg(&output_path)
+        .output()
+        .expect("run markdown-remarkable");
+
+    assert!(
+        !output.status.success(),
+        "expected a non-zero exit when the output directory doesn't exist, got: {:?}",
+        output.status
+    );
+    assert!(
+        !output_path.exists(),
+        "no file should have been created under the missing directory"
+    );
+}
+
+#[test]
+fn exports_a_standalone_non_live_html_file() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let input_path = dir.path().join("doc.md");
+    let output_path = dir.path().join("out.html");
+    std::fs::write(&input_path, "# Hello\n").expect("write markdown file");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
+        .arg(&input_path)
+        .arg("--export")
+        .arg(&output_path)
+        .status()
+        .expect("run markdown-remarkable");
+
+    assert!(status.success(), "expected a successful export");
+
+    let exported = std::fs::read_to_string(&output_path).expect("read exported html file");
+    assert!(exported.contains("<!doctype html>"));
+    assert!(!exported.contains("/version"));
+}
+
+#[test]
+fn exports_a_txt_file_as_plain_text_html() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let input_path = dir.path().join("notes.txt");
+    let output_path = dir.path().join("out.html");
+    std::fs::write(&input_path, "# Title\n\nplain body\n").expect("write text file");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
+        .arg(&input_path)
+        .arg("--export")
+        .arg(&output_path)
+        .status()
+        .expect("run markdown-remarkable");
+
+    assert!(status.success(), "expected a successful export");
+
+    let exported = std::fs::read_to_string(&output_path).expect("read exported html file");
+    assert!(exported.contains("<!doctype html>"));
+    assert!(exported.contains("class=\"plain\""), "{exported}");
+    assert!(!exported.contains("<h1>Title</h1>"), "{exported}");
+    assert!(exported.contains("# Title"), "{exported}");
+    // The `.plain .blk` rule (and its `white-space: pre-wrap`) must not be
+    // scoped under `.doc` in the embedded stylesheet — `render::page` only
+    // adds `.doc` for the live view, so a `.doc`-scoped rule would silently
+    // lose its whitespace/monospace formatting in a standalone `--export`ed
+    // page (see assets/style.css's comment on this). Each assert is
+    // anchored on the rule itself rather than a bare substring:
+    // - a bare `contains(".plain .blk")` also matches `.plain .blk-blank`
+    //   and would still pass even if the real rule were renamed/removed;
+    // - a bare `contains("white-space: pre-wrap")` also matches other rules
+    //   in the stylesheet (e.g. `.review-comment-text`) and would still
+    //   pass even if `.plain .blk` itself lost that declaration.
+    assert!(exported.contains("\n.plain .blk {"), "{exported}");
+    assert!(
+        !exported.contains(".doc .plain .blk"),
+        "`.plain .blk` must not be scoped under `.doc`: {exported}"
+    );
+    assert!(
+        exported.contains("\n.plain .blk {\n  white-space: pre-wrap;"),
+        "{exported}"
+    );
+}
+
+#[test]
+fn export_rejects_more_than_one_file() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file_a = dir.path().join("a.md");
+    let file_b = dir.path().join("b.md");
+    std::fs::write(&file_a, "# A\n").expect("write a.md");
+    std::fs::write(&file_b, "# B\n").expect("write b.md");
+    let output_path = dir.path().join("out.html");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
+        .arg(&file_a)
+        .arg(&file_b)
+        .arg("--export")
+        .arg(&output_path)
+        .output()
+        .expect("run markdown-remarkable");
+
+    assert!(
+        !output.status.success(),
+        "expected a non-zero exit when --export is given more than one FILE, got: {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("exactly one FILE"),
+        "expected stderr to mention \"exactly one FILE\", got: {stderr:?}"
+    );
+}
+
+#[test]
+fn export_rejects_zero_files() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let output_path = dir.path().join("out.html");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
+        .arg("--export")
+        .arg(&output_path)
+        .output()
+        .expect("run markdown-remarkable");
+
+    assert!(
+        !output.status.success(),
+        "expected a non-zero exit when --export is given zero FILE args, got: {:?}",
+        output.status
+    );
+}
+
+#[test]
+fn export_of_a_nonexistent_file_is_a_non_zero_exit() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let missing_path = dir.path().join("does-not-exist.md");
+    let output_path = dir.path().join("out.html");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
+        .arg(&missing_path)
+        .arg("--export")
+        .arg(&output_path)
+        .output()
+        .expect("run markdown-remarkable");
+
+    assert!(
+        !output.status.success(),
+        "expected a non-zero exit when --export targets a nonexistent input file, got: {:?}",
+        output.status
+    );
+}
+
+#[test]
+fn export_conflicts_with_port_and_no_open() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let input_path = dir.path().join("doc.md");
+    let output_path = dir.path().join("out.html");
+    std::fs::write(&input_path, "# Hello\n").expect("write markdown file");
+
+    let with_port = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
+        .arg(&input_path)
+        .arg("--export")
+        .arg(&output_path)
+        .arg("--port")
+        .arg("1234")
+        .output()
+        .expect("run markdown-remarkable");
+    assert!(
+        !with_port.status.success(),
+        "expected --export and --port to be rejected together"
+    );
+
+    let with_no_open = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
+        .arg(&input_path)
+        .arg("--export")
+        .arg(&output_path)
+        .arg("--no-open")
+        .output()
+        .expect("run markdown-remarkable");
+    assert!(
+        !with_no_open.status.success(),
+        "expected --export and --no-open to be rejected together"
+    );
+}

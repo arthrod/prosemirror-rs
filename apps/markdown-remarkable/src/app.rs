@@ -1,0 +1,2022 @@
+//! The native windows: a `tao` event loop hosting one `wry` WebView per open
+//! file, each serving [`crate::routes::handle`] through a single shared
+//! custom protocol instead of an HTTP server (`server.rs`/`--browser`).
+//!
+//! Not covered by automated tests — GUI startup/event-loop code isn't
+//! practical to exercise the way `routes`, `server`, and `watch` are. The
+//! routing logic it calls into (`routes::handle`) is fully unit-tested on
+//! its own. The exceptions are the handful of functions in this module
+//! that are themselves pure, with no window/event-loop/`WebView` dependency
+//! — [`is_internal_url`]/[`is_windows_internal_url`] (the navigation-policy
+//! check deciding whether a URL stays inside the app), [`request_path`]
+//! (query-string handling for the custom-protocol request), and
+//! [`file_stays_under_root`] (the decision half of `PUT /pick-root`'s
+//! `reestablish_root`, split out for exactly this reason — see its own doc
+//! comment) — each unit-tested directly; see the `tests` module at the
+//! bottom of this file. Set `MDVIEW_DEBUG=1` to log every request every
+//! WebView makes through the custom protocol, which is how the live-reload
+//! path gets verified by hand.
+
+use crate::nav_history::NavHistory;
+use crate::routes;
+use crate::util::{file_kind, file_title};
+use crate::watch;
+use crate::window_state::{self, MonitorRect, WindowState};
+use anyhow::{Context, Result};
+use notify::RecommendedWatcher;
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tao::dpi::{LogicalPosition, LogicalSize};
+use tao::event::{Event, StartCause, WindowEvent};
+use tao::event_loop::{
+    ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget,
+};
+use tao::window::{Window, WindowBuilder, WindowId};
+use wry::http::header::{HeaderName, HeaderValue, CONTENT_TYPE};
+use wry::http::{Request, Response, StatusCode};
+use wry::{DragDropEvent, NewWindowResponse, WebView, WebViewBuilder, WebViewId};
+
+#[cfg(target_os = "linux")]
+use tao::platform::unix::WindowExtUnix;
+#[cfg(target_os = "linux")]
+use wry::WebViewBuilderExtUnix;
+
+const WINDOW_WIDTH: f64 = 960.0;
+const WINDOW_HEIGHT: f64 = 800.0;
+
+/// Custom-protocol scheme name registered with every WebView.
+const PROTOCOL: &str = "mdview";
+
+/// The URL every WebView is pointed at on startup, in the form wry expects
+/// for a registered custom protocol on each platform: macOS/Linux keep the
+/// scheme as-is, while Windows (and Android, not targeted here) rewrite it
+/// to `http(s)://<scheme>.localhost/`.
+#[cfg(not(target_os = "windows"))]
+const INITIAL_URL: &str = "mdview://localhost/";
+#[cfg(target_os = "windows")]
+const INITIAL_URL: &str = "http://mdview.localhost/";
+
+/// Prefix (macOS/Linux) or exact origin (Windows) every in-app navigation
+/// shares; anything else is "leaving the document" and is handed to the OS
+/// instead (see `navigation_policy`/[`is_internal_url`]).
+#[cfg(not(target_os = "windows"))]
+const INTERNAL_URL_PREFIX: &str = "mdview://";
+#[cfg(target_os = "windows")]
+const INTERNAL_URL_PREFIX: &str = "http://mdview.localhost";
+
+/// Whether `url` counts as staying inside the app for navigation purposes —
+/// the check behind `navigation_policy`. On macOS/Linux this is a plain
+/// prefix match against [`INTERNAL_URL_PREFIX`] (`mdview://`): safe because
+/// `mdview` is a custom URL scheme this app exclusively owns, so no other
+/// origin can ever start with it.
+///
+/// On Windows, wry serves the custom protocol as an `http://` origin
+/// (`http://mdview.localhost/...`) instead of a real custom scheme, so a
+/// plain `starts_with` is *not* safe there: `http://mdview.localhost` is
+/// also a valid string prefix of `http://mdview.localhost.attacker.example/`
+/// (a different, attacker-owned host — DNS labels nest as suffixes, not
+/// prefixes), `http://mdview.localhost@evil.com/` (`mdview.localhost`
+/// parses as userinfo, `evil.com` is the actual host), and
+/// `http://mdview.localhost:8080/` — none of which is actually this app's
+/// origin. [`is_windows_internal_url`] is the exact-origin check used
+/// instead in that case.
+#[cfg(not(target_os = "windows"))]
+fn is_internal_url(url: &str) -> bool {
+    url.starts_with(INTERNAL_URL_PREFIX)
+}
+
+/// Windows counterpart of [`is_internal_url`] — see its docs for why a
+/// plain prefix match isn't safe for an `http://` origin.
+#[cfg(target_os = "windows")]
+fn is_internal_url(url: &str) -> bool {
+    is_windows_internal_url(url, INTERNAL_URL_PREFIX)
+}
+
+/// The exact-origin check backing [`is_internal_url`] on Windows, factored
+/// out to take `host_prefix` as a parameter (rather than reading
+/// [`INTERNAL_URL_PREFIX`] directly) purely so it can be exercised by
+/// `#[cfg(test)]` with a Windows-shaped prefix regardless of which OS
+/// actually built the test binary. `url` matches only if it's exactly
+/// `host_prefix`, or `host_prefix` immediately followed by `/` (a path) —
+/// nothing else, so a suffix, a userinfo `@`, or a port appended right
+/// after `host_prefix` is correctly rejected rather than accepted by a
+/// naive `starts_with`. Only ever *called* (outside tests) from the
+/// `target_os = "windows"` build of [`is_internal_url`] above, so — same as
+/// [`ZoomDir`]'s variants — a non-Windows build needs its own dead_code
+/// allowance despite this being unconditionally defined.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn is_windows_internal_url(url: &str, host_prefix: &str) -> bool {
+    url.strip_prefix(host_prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// How long to wait after startup for the OS to hand us a file (a Finder
+/// double-click arrives as `Event::Opened` slightly after launch) before
+/// concluding nothing is coming and showing the file picker instead. Only
+/// ever relevant when `run` was given no files at all — see its doc
+/// comment.
+const OPEN_EVENT_GRACE: Duration = Duration::from_millis(400);
+
+/// How long to wait after the last `Moved`/`Resized` event on a window
+/// before writing its geometry to disk — a drag or a resize-by-dragging-
+/// the-edge delivers a burst of these, and only the settled result is worth
+/// a write.
+const WINDOW_STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// How long after a *particular* window is created to ignore `Moved`/
+/// `Resized` events on it for the purposes of scheduling a save —
+/// `set_outer_position` (called right after a window is built) and window
+/// creation itself both generate synthetic events of these kinds, so an
+/// event seen on a window before this deadline (measured from that
+/// window's own creation, not the app's) never schedules a save. That
+/// keeps the first thing ever written to disk for a window from being
+/// "whatever the OS/tao happened to settle on before its own initial
+/// position finished applying," racing against the value that was actually
+/// meant to be restored or cascaded onto it.
+const STARTUP_MOVE_GRACE: Duration = Duration::from_secs(1);
+
+/// Which direction a `View ▸ Zoom In/Out/Actual Size` menu item (or its
+/// accelerator) moves the zoom level. Forwarded to the focused window's
+/// WebView as `window.__mdviewViewer.zoom("in" | "out" | "reset")` — see
+/// `assets/viewer.js` and [`UserEvent::Zoom`].
+///
+/// Every variant is only ever *constructed* inside the macOS-only
+/// `install_menu` (other platforms have no menu bar, hence no zoom menu
+/// item to construct one from); `as_js_arg`'s match on `self` doesn't count
+/// as a construction site, so each variant still needs its own dead_code
+/// allowance on non-macOS builds — same as [`UserEvent::PickFile`].
+enum ZoomDir {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    In,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Out,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Reset,
+}
+
+impl ZoomDir {
+    fn as_js_arg(&self) -> &'static str {
+        match self {
+            ZoomDir::In => "in",
+            ZoomDir::Out => "out",
+            ZoomDir::Reset => "reset",
+        }
+    }
+}
+
+/// Which of the three reading widths a `View ▸ Standard/Wide/Full Width`
+/// menu item (or its accelerator) selects. Forwarded to the focused
+/// window's WebView as
+/// `window.__mdviewViewer.setContentWidth("standard" | "wide" | "full")` —
+/// see `assets/viewer.js` and [`UserEvent::ContentWidth`].
+///
+/// Same macOS-only construction story as [`ZoomDir`]: every variant is
+/// only ever built inside `install_menu`, so each still needs its own
+/// dead_code allowance on non-macOS builds.
+enum ContentWidthMode {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Standard,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Wide,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Full,
+}
+
+impl ContentWidthMode {
+    fn as_js_arg(&self) -> &'static str {
+        match self {
+            ContentWidthMode::Standard => "standard",
+            ContentWidthMode::Wide => "wide",
+            ContentWidthMode::Full => "full",
+        }
+    }
+}
+
+/// Events posted to the loop from outside it: a window's drag&drop handler,
+/// the menu handler, and (on macOS) the OS asking us to open a document
+/// (handled directly in the `Event::Opened` arm, not via this enum).
+enum UserEvent {
+    /// A file dropped onto a specific window. Carries that window's id (set
+    /// by the drag&drop handler, which is created per-window and so always
+    /// knows exactly which one it belongs to) so `run` can decide whether
+    /// to reuse that window (if it's empty) or open a new one — see
+    /// [`open_in_window_or_new`].
+    OpenFile(PathBuf, WindowId),
+    /// Only the macOS menu (File ▸ Open…) posts this today; other
+    /// platforms have no menu bar, so there it's handled but never sent.
+    /// Carries no window id — which window it applies to (the frontmost
+    /// one) is resolved inside `run` via [`focused_window_id`], since the
+    /// menu itself has no way to know that.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    PickFile,
+    /// Only the macOS menu's View submenu posts this — see
+    /// [`install_menu`]. Other platforms have no menu bar at all; their
+    /// zoom shortcuts are handled entirely in `assets/viewer.js`, which
+    /// never needs to round-trip through the event loop. Applies to the
+    /// frontmost window, same as `PickFile`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Zoom(ZoomDir),
+    /// Only the macOS menu's View submenu's Standard/Wide/Full Width items
+    /// post this — see [`install_menu`]. Other platforms have no menu bar
+    /// at all; their content-width shortcuts are handled entirely in
+    /// `assets/viewer.js`, same as [`UserEvent::Zoom`]. Applies to the
+    /// frontmost window, same as `PickFile`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    ContentWidth(ContentWidthMode),
+    /// Only the macOS menu's View ▸ Reload posts this — see
+    /// [`install_menu`]. `assets/review.js` handles ⌘R/Ctrl+R directly with
+    /// `location.reload()` everywhere else (including in every native
+    /// window on non-macOS, which has no menu to intercept the key first).
+    /// Applies to the frontmost window, same as `PickFile`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Reload,
+    /// `PUT /open` (`assets/tree.js`'s file tree) asked to switch the given
+    /// window's file to `path` — posted by [`protocol_response`] whenever
+    /// `routes::handle` returns [`routes::Action::OpenFile`]. Unlike
+    /// [`UserEvent::OpenFile`], this deliberately bypasses
+    /// [`open_in_window_or_new`]'s dedup-and-focus-the-existing-window
+    /// behavior: the whole point of the tree pane is switching *this*
+    /// window's file in place, even if the target happens to already be
+    /// open in some other window — switching stays within the same window
+    /// by design.
+    SwitchFile(PathBuf, WindowId),
+    /// `PUT /nav` (the doc header's back/forward buttons, or ⌘[/⌘]) asked to
+    /// move the given window's history one step — posted by
+    /// [`protocol_response`] whenever `routes::handle` returns
+    /// [`routes::Action::Navigate`]. `run`'s handler is the only place that
+    /// actually pops from a window's [`NavHistory`] (`protocol_response`
+    /// only ever reads a snapshot of it — see `routes::handle`'s `nav`
+    /// parameter docs), same division of labor as [`UserEvent::SwitchFile`]
+    /// vs. `open_file`.
+    Navigate(routes::NavDirection, WindowId),
+    /// Only the macOS menu (File ▸ Open Folder…, ⌘⇧O) posts this — see
+    /// [`install_menu`]. Carries no window id, same as [`UserEvent::PickFile`]
+    /// and for the same reason: the menu handler has no access to `windows`
+    /// at the moment it fires, so `run` resolves it to the frontmost window
+    /// (via [`focused_window_id`]) once the event actually arrives. Other
+    /// platforms have no menu bar at all; the tree pane's own folder button
+    /// (`PUT /pick-root`) reaches the same dialog there instead — see
+    /// [`UserEvent::PickRoot`].
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    PickRootMenu,
+    /// `PUT /pick-root` (the tree pane's folder button) asked to re-pick the
+    /// given window's file-tree root — posted by [`protocol_response`]
+    /// whenever `routes::handle` returns [`routes::Action::PickRoot`].
+    /// Unlike [`UserEvent::PickRootMenu`], this already carries the exact
+    /// window the request came in on, same reasoning as
+    /// [`UserEvent::SwitchFile`]/[`UserEvent::Navigate`] — the protocol
+    /// handler always knows precisely which WebView asked.
+    PickRoot(WindowId),
+}
+
+/// One open window: its `tao` window/`wry` WebView pair, the file state and
+/// live-reload version the shared custom-protocol handler serves through
+/// [`SharedRegistry`], and the watcher currently pointed at that file (if
+/// any). Dropping a `WindowCtx` — as `run` does on `CloseRequested` —
+/// closes its window and stops its watcher; `run` is responsible for also
+/// removing its entry from the registry first (a `WindowCtx` doesn't know
+/// about the registry itself).
+///
+/// Fields are declared `webview` before `window` deliberately: a struct's
+/// fields (with no custom `Drop` impl, as here) drop in declaration order,
+/// and the WebView holds a handle into the window it's mounted on, so it
+/// should be torn down first rather than possibly outliving the window
+/// underneath it, even if only for the duration of drop glue.
+struct WindowCtx {
+    webview: WebView,
+    window: Window,
+    /// This window's key into the shared registry — kept here purely so
+    /// `CloseRequested` can look up and remove exactly this entry.
+    webview_id: String,
+    file: Arc<Mutex<Option<PathBuf>>>,
+    /// `file`'s value canonicalized (or the path as given, if
+    /// canonicalizing fails — e.g. it doesn't exist) — kept in sync by
+    /// [`create_window`]/[`open_file`] whenever `file` changes. Cached here
+    /// rather than recomputed so [`find_window_with_file`] doesn't have to
+    /// touch the filesystem for every other open window on every dedup
+    /// check.
+    canonical_file: Option<PathBuf>,
+    /// This window's file-tree root: the canonicalized parent directory of
+    /// the first file this window ever opened — `Some` from
+    /// [`create_window`] if it was given a file, or set once by
+    /// [`open_file`] (`establish_root: true`) the first time a file lands
+    /// in a window that started empty. `None` only while the window truly
+    /// has no file yet and no root has been picked either.
+    ///
+    /// Never recomputed as a *side effect* of a later switch (`open_file`
+    /// with `establish_root: false`, from `UserEvent::SwitchFile`): `GET
+    /// /tree`/`PUT /open` need a stable scope that survives descending
+    /// into a subdirectory, or switching back out of one would 404 (the
+    /// switch's new file's own parent might be a subdirectory of the real
+    /// root, or — after switching back — the root itself again; recomputing
+    /// it from "whatever's open right now" on every switch would make the
+    /// scope drift with it). It *is* deliberately reassignable through one
+    /// specific, explicit user action — `PUT /pick-root` (the tree pane's
+    /// folder button) or the macOS ⌘⇧O menu item — which is the only other
+    /// thing besides `open_file` that's ever allowed to write here; see
+    /// [`set_root_dir`] (the single write site both funnel through) and
+    /// [`reestablish_root`] for how that path decides what happens to the
+    /// window's currently open file and history when the root underneath
+    /// them moves. See `routes::handle`'s docs for the read-boundary
+    /// rationale, and `routes::tree_root_dir` for how a `None` here (only
+    /// ever true for `server.rs`, which has no `WindowCtx` at all) falls
+    /// back to the pre-fix `asset_parent_dir(file)` behavior.
+    ///
+    /// An `Arc<Mutex<_>>`, same as `file`, so [`protocol_response`] (run on
+    /// the WebView's own protocol-handler thread) can read the current
+    /// value through [`SharedRegistry`] without going through the event
+    /// loop.
+    root_dir: Arc<Mutex<Option<PathBuf>>>,
+    /// This window's back/forward navigation history — `None` until a file
+    /// first lands in it (same "not yet established" moment as
+    /// [`WindowCtx::root_dir`]), `Some` from then on. Unlike `root_dir`,
+    /// every subsequent switch touches this: `open_file`'s `push_history`
+    /// argument decides whether a switch pushes a new entry (a link click,
+    /// the tree pane, a drop, ⌘O — anything that isn't itself a back/
+    /// forward navigation) or leaves it alone (the `PUT /nav`-driven switch
+    /// itself, whose caller — `run`'s `UserEvent::Navigate` handler — has
+    /// already moved the cursor before calling `open_file`).
+    ///
+    /// An `Arc<Mutex<_>>`, same as `root_dir`, so [`protocol_response`] can
+    /// read a `(can_back, can_forward)` snapshot for `GET`/`PUT /nav`
+    /// without going through the event loop, and so `run`'s
+    /// `UserEvent::Navigate` handler can mutate it (via [`NavHistory::back`]/
+    /// [`NavHistory::forward`]) from the event loop's own thread.
+    history: Arc<Mutex<Option<NavHistory>>>,
+    version: Arc<AtomicU64>,
+    watcher: Option<RecommendedWatcher>,
+    /// When this window was created — used only to satisfy
+    /// [`STARTUP_MOVE_GRACE`] and to break ties in [`focused_window_id`]
+    /// ("the most recently created window") when no window reports focus.
+    created_at: Instant,
+}
+
+/// WebView id → that window's file/version/root-dir state, plus the
+/// `WindowId` of the window it belongs to. Populated by [`create_window`]
+/// once its WebView exists, cleared by `run` on `CloseRequested`. Every
+/// window's custom-protocol handler closure closes over a clone of the same
+/// `Arc`, so — although wry requires each `WebViewBuilder` to be given its
+/// own handler *value* — all of them defer to this one shared map and the
+/// same [`protocol_response`] logic, keyed by each request's `webview_id`.
+/// A `webview_id` with no entry (a request arriving for a window that's
+/// already been torn down) gets a 404.
+///
+/// The `WindowId` exists purely so [`protocol_response`] can turn a
+/// successful `PUT /open` (`routes::Action::OpenFile`) into a
+/// [`UserEvent::SwitchFile`] addressed at the right window — the protocol
+/// handler only ever sees a `webview_id` (a string wry hands it), never the
+/// `tao::window::WindowId` `run`'s own event loop needs to look the window
+/// back up.
+struct WindowRegistryEntry {
+    file: Arc<Mutex<Option<PathBuf>>>,
+    version: Arc<AtomicU64>,
+    window_id: WindowId,
+    root_dir: Arc<Mutex<Option<PathBuf>>>,
+    /// See [`WindowCtx::history`]'s docs.
+    history: Arc<Mutex<Option<NavHistory>>>,
+}
+
+type SharedRegistry = Arc<Mutex<HashMap<String, WindowRegistryEntry>>>;
+
+/// Everything creating a new window needs beyond the file to open and the
+/// live `windows` map — bundled so the several places a new window can be
+/// created (startup, `Event::Opened`, drag&drop, ⌘O, the startup picker)
+/// don't each thread the same handful of parameters through by hand.
+/// Rebuilt fresh on every event-loop tick from `run`'s own locals (its
+/// `event_loop` field in particular is only valid for the current tick).
+struct WindowFactory<'a> {
+    event_loop: &'a EventLoopWindowTarget<UserEvent>,
+    proxy: &'a EventLoopProxy<UserEvent>,
+    registry: &'a SharedRegistry,
+    next_webview_id: &'a AtomicU64,
+    debug: bool,
+    allow_remote_images: bool,
+    saved_window_state: Option<WindowState>,
+    monitors: &'a [MonitorRect],
+}
+
+/// Opens the native app: one window per entry in `initial`, or — if it's
+/// empty — a single empty window that shows a file-picker dialog after
+/// [`OPEN_EVENT_GRACE`] unless the OS hands it a file first (a Finder
+/// double-click's `Event::Opened` arrives slightly after launch);
+/// cancelling that dialog just leaves the empty "drop a file here" page
+/// (drop a file, or ⌘O).
+///
+/// After startup, every file dropped, picked, or delivered via
+/// `Event::Opened` either lands in an existing empty/already-open window or
+/// opens a brand-new, cascaded one — see [`open_in_window_or_new`] and the
+/// `Event::Opened` arm below for the exact rules. Closing a window (⌘W, its
+/// close button, or every remaining window closing during ⌘Q) removes it
+/// from `windows`; once none are left, the app exits.
+///
+/// This function's happy path never actually returns `Ok(())`: `tao`'s
+/// `EventLoop::run` has return type `!` (it calls `std::process::exit`
+/// internally once the loop stops), so the only way out of this function is
+/// an `Err` from setup that happens *before* the event loop starts running.
+pub fn run(initial: Vec<PathBuf>, allow_remote_images: bool) -> Result<()> {
+    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    let proxy = event_loop.create_proxy();
+
+    // Keep the menu alive for the whole run: on macOS it's what makes
+    // Cmd+Q / Cmd+O / Cmd+C / Cmd+W work at all (wry doesn't add
+    // accelerators). Cmd+W in particular needs no window-specific code
+    // here — `PredefinedMenuItem::close_window` sends the standard
+    // `performClose:` action, which macOS routes to whichever window is
+    // currently key, so it already closes just the one window without
+    // `run` having to track "the" window itself.
+    let _menu = install_menu(&proxy)?;
+
+    let debug = std::env::var_os("MDVIEW_DEBUG").is_some();
+
+    // Where (if anywhere) a window's last size/position lives, and what's
+    // there, if anything readable — `None` either way just means "use the
+    // built-in defaults" (see resolve_window_geometry). Loaded once, up
+    // front: every new window's cascade base position for the whole run is
+    // measured from this same snapshot, rather than re-reading a file
+    // that's only ever written by *this* process's own debounced/close-time
+    // saves.
+    let window_state_path = window_state::config_path();
+    let saved_window_state = window_state_path.as_deref().and_then(window_state::load);
+    let monitors = monitor_rects(&event_loop);
+
+    let registry: SharedRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let next_webview_id = AtomicU64::new(0);
+    let mut windows: HashMap<WindowId, WindowCtx> = HashMap::new();
+
+    // No files at all still gets exactly one (empty) window, same as
+    // before this module went multi-window — just expressed here as the
+    // one-element case of the general "one window per file" loop below.
+    let initial_is_empty = initial.is_empty();
+    let files: Vec<Option<PathBuf>> = if initial_is_empty {
+        vec![None]
+    } else {
+        initial.into_iter().map(Some).collect()
+    };
+    let startup_factory = WindowFactory {
+        event_loop: &event_loop,
+        proxy: &proxy,
+        registry: &registry,
+        next_webview_id: &next_webview_id,
+        debug,
+        allow_remote_images,
+        saved_window_state,
+        monitors: &monitors,
+    };
+    for file in files {
+        // A duplicate FILE on the command line (`markdown-remarkable a.md a.md`) gets
+        // focused instead of a second window on the same file — the same
+        // dedup rule every other open path applies via
+        // `open_in_window_or_new`/`find_window_with_file`, just inlined
+        // here since there's no single `target` window to hand that helper
+        // during startup.
+        if let Some(path) = &file {
+            if let Some(existing) = find_window_with_file(&windows, path) {
+                if let Some(ctx) = windows.get(&existing) {
+                    ctx.window.set_focus();
+                }
+                continue;
+            }
+        }
+        // The `next_webview_id` counter, not `windows.len()` — see
+        // `new_window_for_file`'s matching comment.
+        let existing_count = next_webview_id.load(Ordering::SeqCst) as usize;
+        let (size, position) =
+            resolve_window_geometry(saved_window_state, &monitors, existing_count);
+        let ctx = create_window(&startup_factory, size, position, file)?;
+        windows.insert(ctx.window.id(), ctx);
+    }
+
+    // While `Some`, we still owe the user a file picker once this deadline
+    // passes (no window has a file yet, and the OS hasn't handed us one).
+    // Only ever scheduled when startup created exactly the one empty
+    // window above — cleared by the first file that reaches any window by
+    // any route.
+    let mut picker_deadline = initial_is_empty.then(|| Instant::now() + OPEN_EVENT_GRACE);
+    // While `Some`, `save_target` names the window that's moved/resized
+    // since the last save and is due to have its geometry written to disk
+    // once this deadline passes (see WINDOW_STATE_SAVE_DEBOUNCE) — both
+    // cleared once that save happens (or the target window closes first).
+    // Every window is also saved unconditionally, deadline or not, on its
+    // own `CloseRequested`; the frontmost window (not necessarily
+    // `save_target`) is saved on `LoopDestroyed`, since `window.json` only
+    // ever holds one window's geometry.
+    let mut save_deadline: Option<Instant> = None;
+    let mut save_target: Option<WindowId> = None;
+
+    event_loop.run(move |event, window_target, control_flow| {
+        let mut exit = false;
+        let factory = WindowFactory {
+            event_loop: window_target,
+            proxy: &proxy,
+            registry: &registry,
+            next_webview_id: &next_webview_id,
+            debug,
+            allow_remote_images,
+            saved_window_state,
+            monitors: &monitors,
+        };
+
+        match event {
+            Event::NewEvents(StartCause::ResumeTimeReached { .. })
+                if picker_deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
+            {
+                picker_deadline = None;
+                if let Some(path) = pick_file_dialog() {
+                    let target = find_empty_window(&windows);
+                    open_in_window_or_new(&mut windows, target, path, &factory);
+                }
+            }
+            Event::NewEvents(StartCause::ResumeTimeReached { .. })
+                if save_deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
+            {
+                save_deadline = None;
+                if let Some(id) = save_target.take() {
+                    if let Some(ctx) = windows.get(&id) {
+                        save_window_state(&ctx.window, window_state_path.as_deref());
+                    }
+                }
+            }
+            Event::Opened { urls } => {
+                // Finder double-click / "Open With" / `open -a`: the OS
+                // hands us file URLs, possibly several at once (opening
+                // multiple selected files together) — every one this app
+                // can open (Markdown or plain text) gets a window.
+                let dropped: Vec<PathBuf> = urls
+                    .iter()
+                    .filter_map(|url| url.to_file_path().ok())
+                    .filter(|path| file_kind(path).is_some())
+                    .collect();
+                if !dropped.is_empty() {
+                    picker_deadline = None;
+                }
+                for path in dropped {
+                    // `open_in_window_or_new` checks for an already-open
+                    // match itself (focusing it instead of opening a
+                    // duplicate), so nothing extra is needed here beyond
+                    // picking the fallback target.
+                    let target = find_empty_window(&windows);
+                    open_in_window_or_new(&mut windows, target, path, &factory);
+                }
+            }
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                window_id,
+                ..
+            } => {
+                // Unconditional, bypassing the debounce: this is the last
+                // chance to persist whatever this window's final geometry
+                // turned out to be.
+                if let Some(ctx) = windows.remove(&window_id) {
+                    save_window_state(&ctx.window, window_state_path.as_deref());
+                    registry
+                        .lock()
+                        .expect("webview registry mutex poisoned")
+                        .remove(&ctx.webview_id);
+                    // `ctx`'s own drop (end of this block) stops its
+                    // watcher and closes its WebView/window.
+                }
+                if save_target == Some(window_id) {
+                    save_deadline = None;
+                    save_target = None;
+                }
+                if windows.is_empty() {
+                    exit = true;
+                }
+            }
+            Event::WindowEvent {
+                event: WindowEvent::Moved(_) | WindowEvent::Resized(_),
+                window_id,
+                ..
+            } if windows
+                .get(&window_id)
+                .is_some_and(|ctx| Instant::now() >= ctx.created_at + STARTUP_MOVE_GRACE) =>
+            {
+                save_deadline = Some(Instant::now() + WINDOW_STATE_SAVE_DEBOUNCE);
+                save_target = Some(window_id);
+            }
+            Event::LoopDestroyed => {
+                // Covers the paths that skip `CloseRequested` entirely —
+                // notably ⌘Q / "Quit" from the Dock on macOS, which
+                // terminates the application directly rather than closing
+                // each window first. This is the last point before the
+                // process actually exits; only one window's geometry can
+                // be remembered (`window.json` holds a single position),
+                // so the frontmost one's is what's kept.
+                if let Some(ctx) = focused_window_id(&windows).and_then(|id| windows.get(&id)) {
+                    save_window_state(&ctx.window, window_state_path.as_deref());
+                }
+            }
+            Event::UserEvent(UserEvent::OpenFile(path, window_id)) => {
+                // A drop always carries an already-resolved file path (see
+                // `handle_drag_drop`), so — same as `Event::Opened` — the
+                // picker deadline is no longer owed once this arrives,
+                // regardless of whether OPEN_EVENT_GRACE has elapsed yet.
+                picker_deadline = None;
+                open_in_window_or_new(&mut windows, Some(window_id), path, &factory);
+            }
+            Event::UserEvent(UserEvent::PickFile) => {
+                if let Some(path) = pick_file_dialog() {
+                    picker_deadline = None;
+                    let target = focused_window_id(&windows);
+                    open_in_window_or_new(&mut windows, target, path, &factory);
+                }
+            }
+            Event::UserEvent(UserEvent::PickRootMenu) => {
+                // Resolved to the frontmost window here, at the moment the
+                // event actually arrives — see this variant's own docs for
+                // why the menu handler can't do that itself.
+                if let Some(id) = focused_window_id(&windows) {
+                    if let Some(ctx) = windows.get_mut(&id) {
+                        pick_and_reestablish_root(ctx);
+                    }
+                }
+            }
+            Event::UserEvent(UserEvent::Zoom(dir)) => {
+                if let Some(ctx) = focused_window_id(&windows).and_then(|id| windows.get(&id)) {
+                    let script = format!(
+                        "window.__mdviewViewer && window.__mdviewViewer.zoom('{}')",
+                        dir.as_js_arg()
+                    );
+                    if let Err(err) = ctx.webview.evaluate_script(&script) {
+                        eprintln!("warning: failed to change zoom: {err}");
+                    }
+                }
+            }
+            Event::UserEvent(UserEvent::ContentWidth(mode)) => {
+                if let Some(ctx) = focused_window_id(&windows).and_then(|id| windows.get(&id)) {
+                    let script = format!(
+                        "window.__mdviewViewer && window.__mdviewViewer.setContentWidth('{}')",
+                        mode.as_js_arg()
+                    );
+                    if let Err(err) = ctx.webview.evaluate_script(&script) {
+                        eprintln!("warning: failed to change content width: {err}");
+                    }
+                }
+            }
+            Event::UserEvent(UserEvent::Reload) => {
+                if let Some(ctx) = focused_window_id(&windows).and_then(|id| windows.get(&id)) {
+                    if let Err(err) = ctx.webview.load_url(INITIAL_URL) {
+                        eprintln!("warning: failed to reload the view: {err}");
+                    }
+                }
+            }
+            Event::UserEvent(UserEvent::SwitchFile(path, window_id)) => {
+                // Not `open_in_window_or_new` (its cascade-a-new-window
+                // fallback doesn't apply here), but its dedup check
+                // (`find_window_with_file`) *does* still apply: two windows
+                // silently ending up open on the same file would race to
+                // clobber each other's review sidecar on save (the sidecar
+                // isn't watched for external changes) — exactly the
+                // invariant `open_in_window_or_new`/`find_window_with_file`
+                // protect everywhere else a file can be opened. If some
+                // *other* window already has `path` open, that window is
+                // focused instead and this one (`window_id`, the one whose
+                // tree pane requested the switch) is left showing whatever
+                // it already had. If `path` is already *this* window's own
+                // file (clicking the tree's own highlighted row), there's
+                // nothing to do either way. A window that's since closed
+                // (a race between the request and `CloseRequested`) is
+                // silently a no-op, same treatment every other best-effort
+                // post-startup action in this module gets.
+                match find_window_with_file(&windows, &path) {
+                    Some(existing_id) if existing_id != window_id => {
+                        if let Some(ctx) = windows.get(&existing_id) {
+                            ctx.window.set_focus();
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        if let Some(ctx) = windows.get_mut(&window_id) {
+                            // `establish_root: false` — a switch never
+                            // moves this window's fixed file-tree root, see
+                            // `WindowCtx::root_dir`'s docs. `push_history:
+                            // true` — the tree pane (like a link click or a
+                            // drop) is an ordinary navigation, not a back/
+                            // forward step.
+                            open_file(ctx, path, false, true);
+                        }
+                    }
+                }
+            }
+            Event::UserEvent(UserEvent::PickRoot(window_id)) => {
+                // A window that's since closed (a race between the request
+                // and `CloseRequested`) is silently a no-op, same treatment
+                // every other best-effort post-startup action in this
+                // module gets.
+                if let Some(ctx) = windows.get_mut(&window_id) {
+                    pick_and_reestablish_root(ctx);
+                }
+            }
+            Event::UserEvent(UserEvent::Navigate(direction, window_id)) => {
+                // The history `Arc` is cloned out from under a short-lived
+                // immutable borrow of `windows` first, then locked and
+                // mutated independently of the map — `find_window_with_file`
+                // below needs its own immutable borrow of `windows`, which
+                // would conflict with holding a `get_mut` across it. See
+                // `protocol_response`'s matching "clone and release the
+                // lock immediately" comment for the same pattern applied to
+                // `file`/`root_dir`.
+                let history_arc = windows.get(&window_id).map(|ctx| Arc::clone(&ctx.history));
+                let moved = history_arc.as_ref().and_then(|history| {
+                    let mut guard = history.lock().expect("history mutex poisoned");
+                    match guard.as_mut() {
+                        Some(history) => match direction {
+                            routes::NavDirection::Back => history.back(),
+                            routes::NavDirection::Forward => history.forward(),
+                        },
+                        // No history yet (shouldn't happen — `PUT /nav`
+                        // only ever returns `Action::Navigate` once `nav`
+                        // was `Some`, i.e. history already exists) or the
+                        // cursor was already at that end by the time this
+                        // event arrived (a race with another `PUT /nav`
+                        // request) — either way, nothing to switch to.
+                        None => None,
+                    }
+                });
+                if let Some(path) = moved {
+                    // Same dedup rule `UserEvent::SwitchFile` applies: two
+                    // windows unknowingly open on the same file would race
+                    // to clobber each other's review sidecar. If some
+                    // *other* window already has this history entry's file
+                    // open, that window is focused instead — and, unlike
+                    // `SwitchFile` (which never moves anything), the cursor
+                    // move above is undone (the opposite of `direction`) so
+                    // it keeps pointing at whatever this window still
+                    // actually displays. Every window's history cursor
+                    // otherwise always names its *own* currently-displayed
+                    // file; leaving it advanced here would violate that for
+                    // a navigation that, from this window's own point of
+                    // view, never actually happened.
+                    match find_window_with_file(&windows, &path) {
+                        Some(existing_id) if existing_id != window_id => {
+                            if let Some(history) = &history_arc {
+                                let mut guard = history.lock().expect("history mutex poisoned");
+                                if let Some(history) = guard.as_mut() {
+                                    match direction {
+                                        routes::NavDirection::Back => {
+                                            history.forward();
+                                        }
+                                        routes::NavDirection::Forward => {
+                                            history.back();
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(ctx) = windows.get(&existing_id) {
+                                ctx.window.set_focus();
+                            }
+                        }
+                        Some(_) => {}
+                        None => {
+                            if let Some(ctx) = windows.get_mut(&window_id) {
+                                // `establish_root: false` — never moves the
+                                // fixed root. `push_history: false` — the
+                                // cursor was already moved above; pushing
+                                // here too would immediately overwrite the
+                                // "forward"/"back" entries this navigation
+                                // just made reachable.
+                                open_file(ctx, path, false, false);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // Decided once per event, at the end, so the pending timers survive
+        // the other events tao delivers in the same iteration.
+        *control_flow = if exit {
+            ControlFlow::Exit
+        } else {
+            match (picker_deadline, save_deadline) {
+                (Some(a), Some(b)) => ControlFlow::WaitUntil(a.min(b)),
+                (Some(deadline), None) | (None, Some(deadline)) => ControlFlow::WaitUntil(deadline),
+                (None, None) => ControlFlow::Wait,
+            }
+        };
+    });
+}
+
+/// Builds one window + WebView pair for `file` (`None` for an empty "drop a
+/// file here" window) at `size`/`position`, registers it in
+/// `factory.registry` under a fresh `w<N>` id (from
+/// `factory.next_webview_id`) once its WebView exists so the shared
+/// custom-protocol handler can find its file/version state, and starts
+/// watching `file` if one was given. Doesn't insert the result into any
+/// `windows` map — callers own that (the startup loop in `run` builds
+/// several before the map even exists). `size`/`position` are computed by
+/// the caller (via [`resolve_window_geometry`]) rather than by this
+/// function itself, since the right `existing_window_count` for the
+/// cascade depends on the `windows` map this function never sees.
+fn create_window(
+    factory: &WindowFactory<'_>,
+    size: LogicalSize<f64>,
+    position: Option<LogicalPosition<f64>>,
+    file: Option<PathBuf>,
+) -> Result<WindowCtx> {
+    let event_loop = factory.event_loop;
+    let proxy = factory.proxy;
+    let registry = factory.registry;
+    let next_webview_id = factory.next_webview_id;
+    let debug = factory.debug;
+    let allow_remote_images = factory.allow_remote_images;
+
+    // Position is deliberately *not* set via `WindowBuilder::with_position`
+    // here: on macOS, tao's builder-time position sets the window's
+    // content-rect origin, not its frame (title-bar-inclusive) origin —
+    // but `save_window_state` reads `Window::outer_position` (the frame
+    // origin) to save, and `Window::set_outer_position` below is its exact
+    // symmetric counterpart. Mixing the two would shift the saved/restored
+    // position by the title bar's height on every single launch. Setting
+    // it after `build()` via `set_outer_position` keeps save and restore
+    // on the same coordinate basis.
+    let window = WindowBuilder::new()
+        .with_title(window_title(file.as_deref()))
+        .with_min_inner_size(LogicalSize::new(
+            window_state::MIN_WIDTH,
+            window_state::MIN_HEIGHT,
+        ))
+        .with_inner_size(size)
+        .build(event_loop)
+        .context("failed to create window")?;
+    if let Some(position) = position {
+        window.set_outer_position(position);
+    }
+
+    let webview_id = format!("w{}", next_webview_id.fetch_add(1, Ordering::SeqCst));
+    let file_state: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(file.clone()));
+    let version: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    // The window's fixed file-tree root — established right away from
+    // `file` if one was given at creation time (the common case: startup,
+    // a new cascaded window, `Event::Opened`, ...), or left `None` for an
+    // empty window until `open_file(_, _, establish_root: true)` sets it
+    // the first time a file lands in it. See `WindowCtx::root_dir`'s docs.
+    let root_dir_state: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(
+        file.as_deref()
+            .map(|path| canonical_or_given(routes::asset_parent_dir(path))),
+    ));
+    // The window's back/forward history — seeded with `file` right away if
+    // one was given (same "established from the get-go" case as
+    // `root_dir_state` above), or left `None` for an empty window until
+    // `open_file` sets it the first time a file lands in it. See
+    // `WindowCtx::history`'s docs.
+    let history_state: Arc<Mutex<Option<NavHistory>>> = Arc::new(Mutex::new(
+        file.as_deref()
+            .map(|path| NavHistory::new(canonical_or_given(path))),
+    ));
+    // `window` already exists at this point (built above), so its id is
+    // available to register alongside the file/version/root-dir state —
+    // see `SharedRegistry`'s docs for why `protocol_response` needs it.
+    let window_id = window.id();
+
+    // Published *before* the WebView is even built, not after — on some
+    // platforms (notably Windows' WebView2) the underlying view can start
+    // delivering requests for this `webview_id` while `build`/`build_gtk`
+    // below is still running, and those must find this state rather than
+    // race the insert and get a spurious 404 (see `protocol_response`). If
+    // construction then fails, the entry is removed again in the error
+    // branches below rather than leaked — nothing else would ever clean it
+    // up, since no `WindowCtx`/`CloseRequested` for it ever comes to exist.
+    registry
+        .lock()
+        .expect("webview registry mutex poisoned")
+        .insert(
+            webview_id.clone(),
+            WindowRegistryEntry {
+                file: Arc::clone(&file_state),
+                version: Arc::clone(&version),
+                window_id,
+                root_dir: Arc::clone(&root_dir_state),
+                history: Arc::clone(&history_state),
+            },
+        );
+
+    let drop_proxy = proxy.clone();
+    let protocol_registry = Arc::clone(registry);
+    let protocol_proxy = proxy.clone();
+    let builder = WebViewBuilder::new()
+        .with_id(webview_id.as_str())
+        .with_custom_protocol(PROTOCOL.into(), move |webview_id, request| {
+            protocol_response(
+                &protocol_registry,
+                &protocol_proxy,
+                webview_id,
+                request,
+                debug,
+                allow_remote_images,
+            )
+        })
+        .with_navigation_handler(navigation_policy)
+        .with_new_window_req_handler(|url, _features| {
+            // Never spawn a second window; treat it like a plain link.
+            navigation_policy(url);
+            NewWindowResponse::Deny
+        })
+        .with_drag_drop_handler(move |event| handle_drag_drop(event, &drop_proxy, window_id))
+        .with_ipc_handler(move |request: Request<String>| {
+            // `assets/viewer.js`'s startup localStorage probe posts its
+            // result here via `window.ipc.postMessage(...)` — the only
+            // way to observe from outside the WebView whether persistence
+            // actually works in this embedder (some sandboxes/WebView
+            // configurations silently disable it). Anything else posted
+            // to `window.ipc` in the future also just lands here, logged
+            // the same way.
+            if debug {
+                eprintln!("[markdown-remarkable:js] {}", request.body());
+            }
+        })
+        .with_url(INITIAL_URL);
+
+    #[cfg(not(target_os = "linux"))]
+    let webview = builder
+        .build(&window)
+        .inspect_err(|_| {
+            registry
+                .lock()
+                .expect("webview registry mutex poisoned")
+                .remove(&webview_id);
+        })
+        .context(
+            "failed to create the WebView (try `markdown-remarkable --browser` to use the browser version instead)",
+        )?;
+    #[cfg(target_os = "linux")]
+    let webview = {
+        let vbox = window.default_vbox().ok_or_else(|| {
+            registry
+                .lock()
+                .expect("webview registry mutex poisoned")
+                .remove(&webview_id);
+            anyhow::anyhow!("failed to access the window's GTK container")
+        })?;
+        builder
+            .build_gtk(vbox)
+            .inspect_err(|_| {
+                registry
+                    .lock()
+                    .expect("webview registry mutex poisoned")
+                    .remove(&webview_id);
+            })
+            .context(
+                "failed to create the WebView — is webkit2gtk installed? \
+                 try `markdown-remarkable --browser` to use the browser version instead",
+            )?
+    };
+
+    let canonical_file = file.as_deref().map(canonical_or_given);
+    let watcher = file.as_deref().and_then(|path| start_watch(path, &version));
+
+    Ok(WindowCtx {
+        webview,
+        window,
+        webview_id,
+        file: file_state,
+        canonical_file,
+        root_dir: root_dir_state,
+        history: history_state,
+        version,
+        watcher,
+        created_at: Instant::now(),
+    })
+}
+
+/// Creates a new, cascaded window for `file` (`None` is never actually
+/// passed by any current caller, but is accepted for symmetry with
+/// [`create_window`]) and inserts it into `windows`. A failure to create
+/// the window is logged and otherwise ignored — the same non-fatal
+/// treatment every other post-startup I/O problem in this module gets,
+/// rather than tearing down the whole running app over one new window that
+/// didn't open.
+fn new_window_for_file(
+    windows: &mut HashMap<WindowId, WindowCtx>,
+    file: Option<PathBuf>,
+    factory: &WindowFactory<'_>,
+) {
+    // The `next_webview_id` counter (not `windows.len()`): it only ever
+    // goes up, so a window that cascaded 3 slots out and was later closed
+    // doesn't cause the *next* new window to cascade back to a position an
+    // already-open window still occupies.
+    let existing_window_count = factory.next_webview_id.load(Ordering::SeqCst) as usize;
+    let (size, position) = resolve_window_geometry(
+        factory.saved_window_state,
+        factory.monitors,
+        existing_window_count,
+    );
+    match create_window(factory, size, position, file) {
+        Ok(ctx) => {
+            windows.insert(ctx.window.id(), ctx);
+        }
+        Err(err) => eprintln!("warning: failed to open a new window: {err}"),
+    }
+}
+
+/// Opens `path`: if it's already showing in some window, that window is
+/// simply brought to the front (never a second window on the same file —
+/// `PUT /review` replaces a file's sidecar wholesale, so two windows
+/// unknowingly open on the same underlying file would race to clobber each
+/// other's comments). Otherwise, it's opened into `target`'s window if that
+/// exists and is currently empty (`file` is `None`), or a brand-new
+/// cascaded window if not. This is the shared rule behind ⌘O, dropping
+/// onto a window, the startup file-picker, and (when no already-open match
+/// was found) `Event::Opened` — each just differs in how it computes
+/// `target` (the window that received the drop, the frontmost window, or
+/// the sole startup window, respectively).
+fn open_in_window_or_new(
+    windows: &mut HashMap<WindowId, WindowCtx>,
+    target: Option<WindowId>,
+    path: PathBuf,
+    factory: &WindowFactory<'_>,
+) {
+    if let Some(existing) = find_window_with_file(windows, &path) {
+        if let Some(ctx) = windows.get(&existing) {
+            ctx.window.set_focus();
+        }
+        return;
+    }
+    let target_is_empty = target.is_some_and(|id| {
+        windows.get(&id).is_some_and(|ctx| {
+            ctx.file
+                .lock()
+                .expect("file state mutex poisoned")
+                .is_none()
+        })
+    });
+    if target_is_empty {
+        if let Some(ctx) = windows.get_mut(&target.expect("checked by target_is_empty")) {
+            // `establish_root: true` — this is the *first* file this
+            // (previously empty) window has ever shown, so its file-tree
+            // root gets fixed here — see `WindowCtx::root_dir`. `push_history:
+            // true` — an ordinary open, not a back/forward navigation.
+            open_file(ctx, path, true, true);
+        }
+        return;
+    }
+    new_window_for_file(windows, Some(path), factory);
+}
+
+/// Switches `ctx`'s served file, re-points its watcher, bumps its version,
+/// updates its window title, and reloads its WebView. The reload (rather
+/// than relying on the live-reload poll alone) is what makes opening a file
+/// recover a view that's stuck on an error page whose script has died.
+///
+/// The WebView is reloaded *first*, before any of `ctx`'s shared state
+/// (`file`, `root_dir`, `version`) changes — not last, as an earlier
+/// revision of this function did. Reloading last left a window open to a
+/// race: the *old* page can have an in-flight request (most notably an
+/// autosave `PUT /review`) still in flight when this function runs; if
+/// `file` had already been swapped to the *new* path by the time that
+/// request reaches `routes::handle_put_review`, its basename-only `doc.file`
+/// check (see that function's docs) could pass against the *new* file's
+/// name — e.g. switching from `a/README.md` to `b/README.md`, both named
+/// `README.md` — silently overwriting the new file's review sidecar with
+/// the old page's stale data. Discarding the old page *first* means any
+/// request it manages to still get in before it's actually torn down is
+/// still served against the (unchanged, at that point) old `file`, and no
+/// such request can reach this handler with a mismatched *new* `file`
+/// underneath it. See `routes.rs`'s
+/// `put_review_matches_only_by_basename_not_by_directory` test for what
+/// this doesn't (and doesn't need to) additionally guard at the routing
+/// layer.
+///
+/// `establish_root` is `true` only when `path` is the *first* file this
+/// window has ever shown (an empty window being filled — see
+/// [`open_in_window_or_new`]): only then is [`WindowCtx::root_dir`] set,
+/// from `path`'s own parent. `false` for every other switch (in
+/// particular, the file tree's `UserEvent::SwitchFile`), which must leave
+/// `root_dir` exactly as it was — see that field's docs for why.
+///
+/// `push_history` is `true` for every switch except the one driven by
+/// `UserEvent::Navigate` itself — a back/forward step already moved
+/// [`WindowCtx::history`]'s cursor before `open_file` was ever called (see
+/// that field's docs), so pushing here too would immediately clobber the
+/// "forward" entries a `back()` just made reachable again. When `true` and
+/// `ctx.history` is still `None` (this is also the first file this window
+/// has ever shown), history is established the same way `root_dir` is
+/// above, from `path` alone rather than from any actual "previous" entry.
+fn open_file(ctx: &mut WindowCtx, path: PathBuf, establish_root: bool, push_history: bool) {
+    if let Err(err) = ctx.webview.load_url(INITIAL_URL) {
+        eprintln!("warning: failed to reload the view: {err}");
+    }
+    let canonical = canonical_or_given(&path);
+    ctx.canonical_file = Some(canonical.clone());
+    if establish_root {
+        let root = canonical_or_given(routes::asset_parent_dir(&path));
+        set_root_dir(ctx, root);
+    }
+    if push_history {
+        let mut history = ctx.history.lock().expect("history mutex poisoned");
+        match history.as_mut() {
+            Some(existing) => existing.push(canonical),
+            None => *history = Some(NavHistory::new(canonical)),
+        }
+    }
+    *ctx.file.lock().expect("file state mutex poisoned") = Some(path.clone());
+    // Drop the old watcher *before* creating the new one so the two never
+    // overlap (they'd double-count a save when both files share a directory).
+    ctx.watcher = None;
+    ctx.watcher = start_watch(&path, &ctx.version);
+    ctx.version.fetch_add(1, Ordering::SeqCst);
+    ctx.window.set_title(&window_title(Some(&path)));
+}
+
+/// The single write site for [`WindowCtx::root_dir`] — called from
+/// `open_file`'s `establish_root: true` branch (a window's very first
+/// file) and from [`reestablish_root`] (`PUT /pick-root`/⌘⇧O, reassigning
+/// it after the fact). Factored out purely so "there is exactly one place
+/// this field is ever written" — the invariant its own doc comment states
+/// — stays true in the source, not just by convention as more ways to
+/// reach it get added.
+fn set_root_dir(ctx: &mut WindowCtx, root: PathBuf) {
+    *ctx.root_dir.lock().expect("root dir mutex poisoned") = Some(root);
+}
+
+/// Whether `file` (a window's cached [`WindowCtx::canonical_file`]) is
+/// still inside `new_root` — the pure decision half of [`reestablish_root`],
+/// split out so it can be unit-tested without a real `WindowCtx` (which
+/// needs a live `WebView`/`Window`, not available to `#[cfg(test)]` here —
+/// see this module's own doc comment on why GUI/event-loop code is mostly
+/// exercised by hand instead). `new_root` is expected to already be
+/// canonicalized (as [`reestablish_root`] does before calling this);
+/// `file` may or may not be, though in practice it always is too (see
+/// [`WindowCtx::canonical_file`]).
+fn file_stays_under_root(file: Option<&Path>, new_root: &Path) -> bool {
+    file.is_some_and(|file| file.starts_with(new_root))
+}
+
+/// Opens the OS-native "choose a folder" dialog, pre-selecting `initial` (a
+/// window's current `root_dir`, if any) via `set_directory` — mirrors
+/// [`pick_file_dialog`], just `pick_folder` instead of `pick_file` and no
+/// extension filter (a folder has none to filter on). Returns `None` if the
+/// user cancels. Deliberately the *only* thing in this module that talks to
+/// `rfd` for this feature — [`reestablish_root`] (the part that actually
+/// applies the result) takes a plain `PathBuf` and knows nothing about
+/// dialogs, which is what keeps that half unit-testable (via
+/// [`file_stays_under_root`]) despite this half not being.
+fn pick_folder_dialog(initial: Option<&Path>) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new();
+    if let Some(dir) = initial {
+        dialog = dialog.set_directory(dir);
+    }
+    dialog.pick_folder()
+}
+
+/// The script [`reestablish_root`]'s `stays_open` branch evaluates: refresh
+/// the tree pane (`assets/tree.js`'s `window.__mdviewTree.reload()`) *and*
+/// the doc header's back/forward buttons and root-relative path label
+/// (`assets/viewer.js`'s `window.__mdviewViewer.refreshDocHeader()`) —
+/// without a full `load_url`, so the document itself (scroll position,
+/// selection, review highlighting) stays untouched. Both are guarded with
+/// `&&` the same way every other `evaluate_script` call in this module
+/// guards its target (the hook might not exist yet if this somehow raced
+/// page setup).
+const TREE_AND_DOC_HEADER_REFRESH_SCRIPT: &str = "\
+    window.__mdviewTree && window.__mdviewTree.reload && window.__mdviewTree.reload(); \
+    window.__mdviewViewer && window.__mdviewViewer.refreshDocHeader && window.__mdviewViewer.refreshDocHeader();";
+
+/// Reassigns `ctx`'s file-tree root to `picked` (as returned by
+/// [`pick_folder_dialog`], not yet canonicalized) — the effect of a
+/// successful `PUT /pick-root`/⌘⇧O. Canonicalizes it first via
+/// [`canonical_or_given`] (falling back to the path as given if that fails,
+/// though a folder a native dialog just returned should always exist).
+///
+/// If the window's currently open file is still inside the new root (see
+/// [`file_stays_under_root`]), it's left completely alone — no reload, no
+/// watcher change, no version bump — so the document's scroll position/
+/// selection/review highlighting all survive untouched; [`set_root_dir`]
+/// alone is enough (the file is, by construction, under *both* the old and
+/// the new root for the whole transition — see below — so there's no
+/// window where `file`/`root_dir` disagree). Only the tree pane and doc
+/// header are told to refresh, via `evaluate_script` running
+/// [`TREE_AND_DOC_HEADER_REFRESH_SCRIPT`] — deliberately *not* the
+/// live-reload `onBodyReplaced` path, since no body was replaced here.
+///
+/// If the file is *not* inside the new root (or there was no file open at
+/// all), the window falls back to the empty "drop a file here" state — the
+/// *document* pane starts empty the same way a brand-new window's does,
+/// though unlike a truly new window this one already has `root_dir: Some`
+/// (just established above), so its tree pane still shows the new root's
+/// contents rather than the 409 a brand-new empty window's `GET /tree`
+/// would give (see `routes::handle_tree`'s docs) — by clearing `file`/
+/// `canonical_file`/the watcher/the title *before* [`set_root_dir`], then
+/// reloading the WebView (`load_url`, same as `open_file` does on every
+/// switch, which itself re-syncs the doc header for free via the fresh
+/// page's own `initDocHeader()`).
+///
+/// That ordering — clear the old file first, *then* move `root_dir` — is
+/// the whole point of splitting this into two branches instead of always
+/// calling [`set_root_dir`] up front: [`protocol_response`] (running
+/// concurrently on the WebView's own protocol-handler thread) reads
+/// `file`/`root_dir`/`history` through three *independent* `Mutex`es, one
+/// short-lived lock at a time, never all three held together — so it can
+/// observe any interleaving of this function's individual writes, not just
+/// the state before or after it as a whole. Setting `root_dir` to the new
+/// value while `file` still named the *old* (now out-of-root) file would
+/// let a `GET /tree` landing in that window observe exactly that
+/// mismatched pair; `tree_relative_path` would then fall back to a bare
+/// file name for `"current"`, and if a same-named file happens to sit at
+/// the new root's top level, `assets/tree.js`'s `highlightCurrent()` would
+/// wrongly highlight it. Clearing `file` to `None` first instead means the
+/// only intermediate states any request can ever observe are `(file: old,
+/// root: old)` and `(file: None, root: old)` (both already-valid,
+/// already-existing pairs — a `None` file with a `Some` root is exactly
+/// what an ordinary empty window looks like) before landing on `(file:
+/// None, root: new)`. No lock is ever held while acquiring another here —
+/// each of `set_root_dir`/the `file` clear/the `history` clear locks,
+/// writes, and immediately releases its own `Mutex` in turn — so this
+/// ordering constraint is about which *intermediate states* become briefly
+/// observable, not about lock nesting/deadlock avoidance.
+///
+/// History is cleared only when the open file is dropped. While that file
+/// stays under the new root, its history stays too — clearing it would make
+/// the next switch the first entry, so Back could no longer return here.
+fn reestablish_root(ctx: &mut WindowCtx, picked: PathBuf) {
+    let root = canonical_or_given(&picked);
+    let stays_open = file_stays_under_root(ctx.canonical_file.as_deref(), &root);
+
+    if stays_open {
+        set_root_dir(ctx, root);
+        if let Err(err) = ctx
+            .webview
+            .evaluate_script(TREE_AND_DOC_HEADER_REFRESH_SCRIPT)
+        {
+            eprintln!("warning: failed to refresh the file tree: {err}");
+        }
+    } else {
+        // Clear the old file *before* moving `root_dir` — see the ordering
+        // rationale in this function's own doc comment above.
+        ctx.canonical_file = None;
+        *ctx.file.lock().expect("file state mutex poisoned") = None;
+        ctx.watcher = None;
+        ctx.window.set_title(&window_title(None));
+        set_root_dir(ctx, root);
+        *ctx.history.lock().expect("history mutex poisoned") = None;
+        if let Err(err) = ctx.webview.load_url(INITIAL_URL) {
+            eprintln!("warning: failed to reload the view: {err}");
+        }
+    }
+}
+
+/// Opens the folder dialog (pre-selected at `ctx`'s current `root_dir`) and,
+/// if the user picks one, applies it — the shared tail both
+/// [`UserEvent::PickRootMenu`] and [`UserEvent::PickRoot`] run once each has
+/// resolved its own way to a specific `&mut WindowCtx` (frontmost window vs.
+/// the exact window the `PUT /pick-root` request came in on).
+fn pick_and_reestablish_root(ctx: &mut WindowCtx) {
+    let initial = ctx
+        .root_dir
+        .lock()
+        .expect("root dir mutex poisoned")
+        .clone();
+    if let Some(folder) = pick_folder_dialog(initial.as_deref()) {
+        reestablish_root(ctx, folder);
+    }
+}
+
+/// `path.canonicalize()`, or `path` itself if that fails (most likely
+/// because it doesn't exist, which shouldn't happen for anything reaching
+/// this — every caller passes a path the OS/dialog/drop just handed us as
+/// an existing file — but is handled rather than unwrapped regardless).
+/// Used wherever two paths need comparing as "the same file" — see
+/// [`find_window_with_file`] — so a relative path, an absolute path, and a
+/// symlink all pointing at one file are recognized as the same file rather
+/// than only an exact string match.
+fn canonical_or_given(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The window (if any) already showing `path`, compared via
+/// [`canonical_or_given`] against each window's own cached
+/// `canonical_file` — so the same file opened via two different
+/// relative/absolute spellings, or through a symlink, is still recognized
+/// as one file, not two. This matters beyond cosmetics: `PUT /review`
+/// replaces a file's comment sidecar wholesale, so two windows unknowingly
+/// open on the same underlying file would race to clobber each other's
+/// comments — every path that can open a file (see [`open_in_window_or_new`]
+/// and `run`'s startup loop) checks this first.
+fn find_window_with_file(windows: &HashMap<WindowId, WindowCtx>, path: &Path) -> Option<WindowId> {
+    let target = canonical_or_given(path);
+    windows.iter().find_map(|(id, ctx)| {
+        (ctx.canonical_file.as_deref() == Some(target.as_path())).then_some(*id)
+    })
+}
+
+/// The window (if any) with no file open yet. There is at most one of
+/// these at any point in a run — the only way one is ever created is the
+/// startup case in `run` (when `initial` is empty), and every subsequent
+/// open either fills that one window or creates a new, already-non-empty
+/// one — so "the" is well-defined.
+fn find_empty_window(windows: &HashMap<WindowId, WindowCtx>) -> Option<WindowId> {
+    windows.iter().find_map(|(id, ctx)| {
+        ctx.file
+            .lock()
+            .expect("file state mutex poisoned")
+            .is_none()
+            .then_some(*id)
+    })
+}
+
+/// The window menu-originated events (Zoom/Reload/Open…) apply to: the one
+/// `Window::is_focused` reports true for, or — if none does (e.g. right
+/// after the file dialog itself had focus) — the most recently created
+/// one, since `HashMap` iteration order isn't creation order and there's no
+/// other definition of "last" to fall back to.
+fn focused_window_id(windows: &HashMap<WindowId, WindowCtx>) -> Option<WindowId> {
+    windows
+        .values()
+        .find(|ctx| ctx.window.is_focused())
+        .or_else(|| windows.values().max_by_key(|ctx| ctx.created_at))
+        .map(|ctx| ctx.window.id())
+}
+
+/// Every attached monitor's bounds, in logical pixels — used only to check
+/// whether a saved/cascaded window position (see [`resolve_window_geometry`])
+/// is still somewhere visible; the monitor it was on might have been
+/// unplugged, or the saved file might just be stale/hand-edited.
+fn monitor_rects(event_loop: &EventLoop<UserEvent>) -> Vec<MonitorRect> {
+    event_loop
+        .available_monitors()
+        .map(|monitor| {
+            let scale = monitor.scale_factor();
+            let position = monitor.position().to_logical::<f64>(scale);
+            let size = monitor.size().to_logical::<f64>(scale);
+            MonitorRect {
+                x: position.x,
+                y: position.y,
+                width: size.width,
+                height: size.height,
+            }
+        })
+        .collect()
+}
+
+/// Turns a possibly-absent saved [`WindowState`] into the size (always
+/// present — falls back to the built-in default) and position for the
+/// `existing_window_count`-th window being created (0 for the very first
+/// window in a run, incrementing for each new window opened after it) — the
+/// saved position, cascaded by `existing_window_count *
+/// [`window_state::CASCADE_OFFSET`]` (see [`window_state::cascade_position`]),
+/// so each new window peeks out from behind the last rather than stacking
+/// exactly on top of it. Only `Some` if that (possibly cascaded) position is
+/// still within one of `monitors`; otherwise `None`, and the OS chooses
+/// where the window lands, same as before window persistence existed.
+fn resolve_window_geometry(
+    saved: Option<WindowState>,
+    monitors: &[MonitorRect],
+    existing_window_count: usize,
+) -> (LogicalSize<f64>, Option<LogicalPosition<f64>>) {
+    let Some(state) = saved else {
+        return (LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT), None);
+    };
+    let (width, height) = window_state::clamp_size(state.width, state.height);
+    let (x, y) = window_state::cascade_position(state.x, state.y, existing_window_count);
+    let position =
+        window_state::position_is_visible(x, y, monitors).then(|| LogicalPosition::new(x, y));
+    (LogicalSize::new(width, height), position)
+}
+
+/// Saves `window`'s current outer position and inner size to `path`
+/// (logical pixels), if there's anywhere to save to at all — `path` is
+/// `None` when [`window_state::config_path`] couldn't determine a config
+/// directory (e.g. no `HOME` in the environment), which is a warning, not a
+/// hard failure, same as every other window-state I/O problem. A failure
+/// to *query* the position (some platforms/compositors don't support it)
+/// falls back to `(0, 0)` rather than dropping the save entirely — still a
+/// valid, visible-somewhere position to restore later.
+fn save_window_state(window: &Window, path: Option<&Path>) {
+    let Some(path) = path else {
+        return;
+    };
+    // Minimizing fires Moved/Resized (often with a 0×0 size). Persisting
+    // that would restore the window minimized, or tiny, on the next launch.
+    if window.is_minimized() {
+        return;
+    }
+    let scale = window.scale_factor();
+    let position = window
+        .outer_position()
+        .map(|position| position.to_logical::<f64>(scale))
+        .unwrap_or_default();
+    let size = window.inner_size().to_logical::<f64>(scale);
+    let state = WindowState {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+    };
+    if let Err(err) = window_state::save(path, &state) {
+        eprintln!("warning: failed to save window state: {err}");
+    }
+}
+
+/// Starts watching `path`, logging (and continuing without live-reload)
+/// rather than failing the whole app if the watcher can't be created.
+fn start_watch(path: &Path, version: &Arc<AtomicU64>) -> Option<RecommendedWatcher> {
+    match watch::watch(path, Arc::clone(version)) {
+        Ok(watcher) => Some(watcher),
+        Err(err) => {
+            eprintln!(
+                "warning: live-reload disabled for {}: {err}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// The path `routes::handle` should route on for `request` — `path` plus
+/// `?query` when there is one, e.g. `/asset?p=img.png`. `Uri::path()` alone
+/// drops the query string entirely; using it directly used to make every
+/// query-string-dependent route (`GET /asset?p=...`, the only one so far)
+/// see no query at all through the native window's custom protocol, so
+/// e.g. `handle_asset` always fell straight to its "missing `p` query
+/// parameter" `400` regardless of what the page actually requested — a
+/// regression the browser server (`server.rs`, which reads `path` straight
+/// off the raw request line, query string included) never had.
+fn request_path(request: &Request<Vec<u8>>) -> &str {
+    request
+        .uri()
+        .path_and_query()
+        .map(|path_and_query| path_and_query.as_str())
+        .unwrap_or("/")
+}
+
+/// The custom-protocol handler shared by every window: looks up
+/// `webview_id` in `registry` (populated by [`create_window`], cleared by
+/// `run` on `CloseRequested`) for that window's current file/version state
+/// and routes the request through `routes::handle`, same as the browser
+/// server does for an HTTP request — with `allow_open: true`, since every
+/// native window can switch its own file (see `routes::handle_open`'s
+/// docs). If that returns [`routes::Action::OpenFile`], this posts a
+/// [`UserEvent::SwitchFile`] back to the event loop via `proxy` rather than
+/// touching any window state directly — this function runs on the WebView's
+/// own protocol-handler thread, not the event loop's. A `webview_id` with
+/// no entry — a request arriving for a window that's already been torn
+/// down, or (shouldn't happen) one that was never registered — gets a
+/// plain 404 instead of a panic.
+fn protocol_response(
+    registry: &SharedRegistry,
+    proxy: &EventLoopProxy<UserEvent>,
+    webview_id: WebViewId<'_>,
+    request: Request<Vec<u8>>,
+    debug: bool,
+    allow_remote_images: bool,
+) -> Response<Cow<'static, [u8]>> {
+    let Some((file_state, version, window_id, root_dir_state, history_state)) = registry
+        .lock()
+        .expect("webview registry mutex poisoned")
+        .get(webview_id)
+        .map(|entry| {
+            (
+                Arc::clone(&entry.file),
+                Arc::clone(&entry.version),
+                entry.window_id,
+                Arc::clone(&entry.root_dir),
+                Arc::clone(&entry.history),
+            )
+        })
+    else {
+        if debug {
+            eprintln!("[markdown-remarkable] request for unknown webview id {webview_id:?}");
+        }
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Cow::Borrowed(b"404 Not Found" as &[u8]))
+            .expect("static fallback response is valid");
+    };
+
+    let path = request_path(&request).to_owned();
+    let method = request.method().as_str().to_owned();
+    let headers: Vec<(String, String)> = request
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.to_string(),
+                value.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    let body = request.body().clone();
+    let route_request = routes::RouteRequest {
+        method: &method,
+        path: &path,
+        headers: &headers,
+        body: &body,
+    };
+
+    // Cloned and the lock released immediately (the temporary guard drops
+    // at the end of this statement) rather than held across
+    // `routes::handle` below — that call does file I/O (reading the
+    // Markdown file, the review sidecar) that can take a while, and this
+    // same `file` mutex is also what `open_file`, running on the event
+    // loop's own thread, locks (briefly) whenever this window's file
+    // changes. Holding it here for the length of a request would make
+    // switching this window's file wait on whatever the WebView's
+    // protocol-handler thread happens to be doing at that moment.
+    let file = file_state
+        .lock()
+        .expect("file state mutex poisoned")
+        .clone();
+    // Same "clone and release the lock immediately" reasoning as `file`
+    // above — `root_dir` is only ever *written* once (`open_file`
+    // establishing it for a previously-empty window), but reading it
+    // through the same short-lived guard pattern keeps this uniform rather
+    // than special-cased.
+    let root_dir = root_dir_state
+        .lock()
+        .expect("root dir mutex poisoned")
+        .clone();
+    // Same "clone and release the lock immediately" reasoning as `file`/
+    // `root_dir` above — this only reads a `(can_back, can_forward)`
+    // snapshot, never mutates the history itself (see `routes::handle`'s
+    // `nav` parameter docs for why that split exists at all).
+    let nav = history_state
+        .lock()
+        .expect("history mutex poisoned")
+        .as_ref()
+        .map(|history| (history.can_back(), history.can_forward()));
+    let (reply, action) = routes::handle(
+        &route_request,
+        file.as_deref(),
+        &version,
+        allow_remote_images,
+        true,
+        root_dir.as_deref(),
+        nav,
+    );
+    match action {
+        routes::Action::OpenFile(path) => {
+            // If the event loop has already shut down, there's nothing
+            // useful to do with the error — the process is exiting anyway.
+            let _ = proxy.send_event(UserEvent::SwitchFile(path, window_id));
+        }
+        routes::Action::Navigate(direction) => {
+            let _ = proxy.send_event(UserEvent::Navigate(direction, window_id));
+        }
+        routes::Action::PickRoot => {
+            let _ = proxy.send_event(UserEvent::PickRoot(window_id));
+        }
+        routes::Action::None => {}
+    }
+    if debug {
+        // The body byte count is only interesting for state-changing
+        // requests (PUT/POST) — that's how the body reaches this handler
+        // gets confirmed to actually be non-empty when testing on macOS,
+        // where `MDVIEW_DEBUG=1` is the only visibility into the WebView's
+        // custom-protocol handler.
+        let body_suffix = match method.as_str() {
+            "PUT" | "POST" => format!(" (body {} bytes)", body.len()),
+            _ => String::new(),
+        };
+        eprintln!(
+            "[markdown-remarkable] {webview_id} {method} {path} -> {}{body_suffix}",
+            reply.status
+        );
+    }
+
+    let mut response = match Response::builder()
+        .status(reply.status)
+        .header(CONTENT_TYPE, reply.content_type)
+        .body(Cow::Owned(reply.body))
+    {
+        Ok(response) => response,
+        Err(err) => {
+            eprintln!("warning: failed to build response for {path}: {err}");
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Cow::Borrowed(b"500 Internal Server Error" as &[u8]))
+                .expect("static fallback response is valid");
+        }
+    };
+    // Extra headers are added one at a time so a single unrepresentable
+    // value drops just that header instead of the whole response.
+    for (name, value) in &reply.headers {
+        match (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            (Ok(name), Ok(value)) => {
+                response.headers_mut().insert(name, value);
+            }
+            _ => eprintln!("warning: dropping response header {name}: not representable"),
+        }
+    }
+    response
+}
+
+/// Decides whether a WebView may navigate to `url`. Only the app's own
+/// protocol stays inside the window; web links open in the default browser
+/// instead, and anything else is simply ignored. This isn't because the
+/// window has no way back — it has a doc header with back/forward buttons
+/// now (see `nav_history`) — but a deliberate design boundary: this
+/// WebView's whole purpose is to render the currently open document (and,
+/// via a relative link, other files this app can open — Markdown or plain
+/// text — inside its `root_dir`, see `routes::handle_open`), never to load
+/// arbitrary external web content as its own top-level page. See
+/// `docs/SECURITY.md`'s exception 1 for the user-facing version of this.
+fn navigation_policy(url: String) -> bool {
+    if is_internal_url(&url) {
+        return true;
+    }
+    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
+        if let Err(err) = open::that(&url) {
+            // The URL is user/document-controlled and unbounded in length;
+            // truncated so one huge/crafted link can't blow up the log.
+            let truncated: String = url.chars().take(120).collect();
+            let suffix = if truncated.len() < url.len() {
+                "…"
+            } else {
+                ""
+            };
+            eprintln!("warning: could not open {truncated}{suffix}: {err}");
+        }
+    }
+    false
+}
+
+/// Every file this app can open (`.md`/`.markdown`/`.txt`, case-insensitive)
+/// is accepted — dropping several files at once opens all of them, not just
+/// the first — while anything else in the drop is silently skipped.
+/// Returns `true` if at least one file was accepted, `false` if none were
+/// (in which case the drop is left to whatever the OS/WebView would
+/// otherwise do with it, same as before this handled any of it). `window_id`
+/// is the window that received the drop — each window's drag&drop handler
+/// closes over its own, so this is always known precisely, never resolved
+/// after the fact. Each accepted file is posted as its own separate
+/// `UserEvent::OpenFile`; `run`'s handler for that event then decides
+/// per-file whether it lands in this window (if it's still empty) or opens
+/// a new one — see [`open_in_window_or_new`].
+fn handle_drag_drop(
+    event: DragDropEvent,
+    proxy: &EventLoopProxy<UserEvent>,
+    window_id: WindowId,
+) -> bool {
+    let DragDropEvent::Drop { paths, .. } = event else {
+        return false;
+    };
+    let mut accepted_any = false;
+    for path in paths.into_iter().filter(|path| file_kind(path).is_some()) {
+        // If the event loop has already shut down, there's nothing
+        // useful to do with the error — the process is exiting anyway.
+        let _ = proxy.send_event(UserEvent::OpenFile(path, window_id));
+        accepted_any = true;
+    }
+    accepted_any
+}
+
+fn pick_file_dialog() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("Markdown / Text", &["md", "markdown", "txt"])
+        .pick_file()
+}
+
+/// A native window's title bar text: `<file name> — markdown-remarkable`, or
+/// just `markdown-remarkable` before any file has been opened in it.
+fn window_title(file: Option<&Path>) -> String {
+    match file {
+        Some(path) => format!("{} — markdown-remarkable", file_title(path)),
+        None => "markdown-remarkable".to_string(),
+    }
+}
+
+/// macOS: a minimal, app-wide application menu (there is only ever one, no
+/// matter how many windows are open). Without one, none of the standard
+/// shortcuts (Cmd+Q, Cmd+W, Cmd+C, Cmd+A) work in any window. File ▸ Open…
+/// (Cmd+O) posts [`UserEvent::PickFile`] back to the event loop; the View
+/// submenu's Zoom In/Out/Actual Size/Reload post [`UserEvent::Zoom`]/
+/// [`UserEvent::Reload`], and its Standard/Wide/Full Width items (below a
+/// separator) post [`UserEvent::ContentWidth`] — `run` resolves all of
+/// these to whichever window is currently frontmost (see
+/// [`focused_window_id`]) and turns them into an `evaluate_script` call
+/// into `assets/viewer.js` (zoom, content width) or a full `load_url`
+/// (reload) on that window's WebView. Window ▸ Close closes just
+/// the frontmost window natively (see `run`'s doc comment). Because these
+/// accelerators are handled by the menu, the corresponding keydown never
+/// reaches any WebView at all on macOS, so `assets/viewer.js`'s own
+/// keyboard handler (which exists for Windows/Linux and `--browser` mode)
+/// never double-fires here — see its module docs.
+#[cfg(target_os = "macos")]
+fn install_menu(proxy: &EventLoopProxy<UserEvent>) -> Result<muda::Menu> {
+    use muda::accelerator::{Accelerator, Code, Modifiers};
+    use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+
+    const OPEN_ITEM_ID: &str = "open";
+    const OPEN_FOLDER_ITEM_ID: &str = "open-folder";
+    const ZOOM_IN_ITEM_ID: &str = "zoom-in";
+    const ZOOM_OUT_ITEM_ID: &str = "zoom-out";
+    const ZOOM_RESET_ITEM_ID: &str = "zoom-reset";
+    const RELOAD_ITEM_ID: &str = "reload";
+    const CONTENT_WIDTH_STANDARD_ITEM_ID: &str = "content-width-standard";
+    const CONTENT_WIDTH_WIDE_ITEM_ID: &str = "content-width-wide";
+    const CONTENT_WIDTH_FULL_ITEM_ID: &str = "content-width-full";
+
+    let menu = Menu::new();
+    let app = Submenu::with_items(
+        "markdown-remarkable",
+        true,
+        &[&PredefinedMenuItem::quit(None)],
+    )?;
+    let open = MenuItem::with_id(
+        OPEN_ITEM_ID,
+        "Open…",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyO)),
+    );
+    // Re-picks the frontmost window's file-tree root — see
+    // `UserEvent::PickRootMenu`/`reestablish_root`. Same feature the tree
+    // pane's own folder button reaches via `PUT /pick-root`; this is just
+    // the macOS menu/accelerator route to it.
+    let open_folder = MenuItem::with_id(
+        OPEN_FOLDER_ITEM_ID,
+        "Open Folder…",
+        true,
+        Some(Accelerator::new(
+            Some(Modifiers::SUPER | Modifiers::SHIFT),
+            Code::KeyO,
+        )),
+    );
+    let file = Submenu::with_items("File", true, &[&open, &open_folder])?;
+    let edit = Submenu::with_items(
+        "Edit",
+        true,
+        &[
+            &PredefinedMenuItem::copy(None),
+            &PredefinedMenuItem::select_all(None),
+        ],
+    )?;
+    let zoom_in = MenuItem::with_id(
+        ZOOM_IN_ITEM_ID,
+        "Zoom In",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER), Code::Equal)),
+    );
+    let zoom_out = MenuItem::with_id(
+        ZOOM_OUT_ITEM_ID,
+        "Zoom Out",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER), Code::Minus)),
+    );
+    let zoom_reset = MenuItem::with_id(
+        ZOOM_RESET_ITEM_ID,
+        "Actual Size",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER), Code::Digit0)),
+    );
+    let reload = MenuItem::with_id(
+        RELOAD_ITEM_ID,
+        "Reload",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyR)),
+    );
+    // Reading width — see `ContentWidthMode`/`UserEvent::ContentWidth`.
+    // Cmd+Shift+1/2/0 rather than the more obvious Cmd+Shift+1/2/3: macOS
+    // reserves Cmd+Shift+3/4/5(/6) system-wide for screenshots, which would
+    // either not reach this accelerator at all or shadow it depending on
+    // the OS version — 0 stands in for "full" (no cap), echoing zoom's own
+    // Cmd+0 "back to the unmodified state". Plain Cmd+Alt+1/2/3 was ruled
+    // out too: `assets/viewer.js`'s keydown handler (Windows/Linux and
+    // `--browser`) deliberately ignores every Ctrl/Cmd shortcut while
+    // `event.altKey` is set, since AltGr (many European layouts) arrives as
+    // Ctrl+Alt and would otherwise misfire it on ordinary typing — see that
+    // handler's own comment.
+    let content_width_standard = MenuItem::with_id(
+        CONTENT_WIDTH_STANDARD_ITEM_ID,
+        "Standard Width",
+        true,
+        Some(Accelerator::new(
+            Some(Modifiers::SUPER | Modifiers::SHIFT),
+            Code::Digit1,
+        )),
+    );
+    let content_width_wide = MenuItem::with_id(
+        CONTENT_WIDTH_WIDE_ITEM_ID,
+        "Wide Width",
+        true,
+        Some(Accelerator::new(
+            Some(Modifiers::SUPER | Modifiers::SHIFT),
+            Code::Digit2,
+        )),
+    );
+    let content_width_full = MenuItem::with_id(
+        CONTENT_WIDTH_FULL_ITEM_ID,
+        "Full Width",
+        true,
+        Some(Accelerator::new(
+            Some(Modifiers::SUPER | Modifiers::SHIFT),
+            Code::Digit0,
+        )),
+    );
+    let view = Submenu::with_items(
+        "View",
+        true,
+        &[
+            &zoom_in,
+            &zoom_out,
+            &zoom_reset,
+            &reload,
+            &PredefinedMenuItem::separator(),
+            &content_width_standard,
+            &content_width_wide,
+            &content_width_full,
+        ],
+    )?;
+    let window = Submenu::with_items("Window", true, &[&PredefinedMenuItem::close_window(None)])?;
+    menu.append(&app)?;
+    menu.append(&file)?;
+    menu.append(&edit)?;
+    menu.append(&view)?;
+    menu.append(&window)?;
+    menu.init_for_nsapp();
+
+    // The handler must be Send + Sync; the proxy itself is only Send.
+    let proxy = Mutex::new(proxy.clone());
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        let user_event = if event.id() == OPEN_ITEM_ID {
+            Some(UserEvent::PickFile)
+        } else if event.id() == OPEN_FOLDER_ITEM_ID {
+            Some(UserEvent::PickRootMenu)
+        } else if event.id() == ZOOM_IN_ITEM_ID {
+            Some(UserEvent::Zoom(ZoomDir::In))
+        } else if event.id() == ZOOM_OUT_ITEM_ID {
+            Some(UserEvent::Zoom(ZoomDir::Out))
+        } else if event.id() == ZOOM_RESET_ITEM_ID {
+            Some(UserEvent::Zoom(ZoomDir::Reset))
+        } else if event.id() == RELOAD_ITEM_ID {
+            Some(UserEvent::Reload)
+        } else if event.id() == CONTENT_WIDTH_STANDARD_ITEM_ID {
+            Some(UserEvent::ContentWidth(ContentWidthMode::Standard))
+        } else if event.id() == CONTENT_WIDTH_WIDE_ITEM_ID {
+            Some(UserEvent::ContentWidth(ContentWidthMode::Wide))
+        } else if event.id() == CONTENT_WIDTH_FULL_ITEM_ID {
+            Some(UserEvent::ContentWidth(ContentWidthMode::Full))
+        } else {
+            None
+        };
+        if let Some(user_event) = user_event {
+            if let Ok(proxy) = proxy.lock() {
+                let _ = proxy.send_event(user_event);
+            }
+        }
+    }));
+    Ok(menu)
+}
+
+/// Placeholder for platforms without a menu bar, so `run` can hold "the
+/// menu" uniformly (a unit value there would trip clippy's `let_unit_value`).
+#[cfg(not(target_os = "macos"))]
+struct NoMenu;
+
+/// Other platforms get no menu bar (window chrome provides close/quit).
+#[cfg(not(target_os = "macos"))]
+fn install_menu(_proxy: &EventLoopProxy<UserEvent>) -> Result<NoMenu> {
+    Ok(NoMenu)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `as_js_arg`'s match arms are only ever exercised via `install_menu`
+    // (macOS-only, and only when a menu item is actually clicked), so these
+    // pin down the string vocabulary `assets/viewer.js`'s
+    // `setContentWidth` expects directly, on every platform `cargo test`
+    // runs on.
+    #[test]
+    fn content_width_mode_as_js_arg_standard() {
+        assert_eq!(ContentWidthMode::Standard.as_js_arg(), "standard");
+    }
+
+    #[test]
+    fn content_width_mode_as_js_arg_wide() {
+        assert_eq!(ContentWidthMode::Wide.as_js_arg(), "wide");
+    }
+
+    #[test]
+    fn content_width_mode_as_js_arg_full() {
+        assert_eq!(ContentWidthMode::Full.as_js_arg(), "full");
+    }
+
+    // `request_path` is what feeds `RouteRequest::path` in
+    // `protocol_response` — see its doc comment for why `Uri::path()` alone
+    // (dropping the query string) made every query-string-dependent route
+    // (`GET /asset?p=...`) see no query at all in the native window.
+    #[test]
+    fn request_path_includes_the_query_string() {
+        let request = Request::builder()
+            .uri("mdview://localhost/asset?p=img.png")
+            .body(Vec::new())
+            .expect("build request");
+        assert_eq!(request_path(&request), "/asset?p=img.png");
+    }
+
+    #[test]
+    fn request_path_without_a_query_string_is_just_the_path() {
+        let request = Request::builder()
+            .uri("mdview://localhost/body")
+            .body(Vec::new())
+            .expect("build request");
+        assert_eq!(request_path(&request), "/body");
+    }
+
+    // `is_windows_internal_url` is tested directly against a Windows-shaped
+    // prefix regardless of which OS actually built this test binary — see
+    // its doc comment for why it takes `host_prefix` as a parameter rather
+    // than reading `INTERNAL_URL_PREFIX`.
+    const WINDOWS_PREFIX: &str = "http://mdview.localhost";
+
+    #[test]
+    fn windows_internal_url_accepts_exact_origin_and_paths() {
+        assert!(is_windows_internal_url(
+            "http://mdview.localhost/",
+            WINDOWS_PREFIX
+        ));
+        assert!(is_windows_internal_url(
+            "http://mdview.localhost",
+            WINDOWS_PREFIX
+        ));
+        assert!(is_windows_internal_url(
+            "http://mdview.localhost/some/path",
+            WINDOWS_PREFIX
+        ));
+    }
+
+    #[test]
+    fn windows_internal_url_rejects_spoofed_suffix() {
+        assert!(!is_windows_internal_url(
+            "http://mdview.localhost.attacker.example/",
+            WINDOWS_PREFIX
+        ));
+    }
+
+    #[test]
+    fn windows_internal_url_rejects_userinfo_spoof() {
+        assert!(!is_windows_internal_url(
+            "http://mdview.localhost@evil.com/",
+            WINDOWS_PREFIX
+        ));
+    }
+
+    #[test]
+    fn windows_internal_url_rejects_port_spoof() {
+        assert!(!is_windows_internal_url(
+            "http://mdview.localhost:8080/",
+            WINDOWS_PREFIX
+        ));
+    }
+
+    #[test]
+    fn scheme_internal_url_prefix_match_still_works() {
+        // The macOS/Linux side stays a plain prefix match — `mdview://` is a
+        // custom scheme this app exclusively owns, so no exact-origin check
+        // is needed there.
+        assert!("mdview://localhost/body".starts_with("mdview://"));
+        assert!(!"mdview-evil://localhost/".starts_with("mdview://"));
+    }
+
+    // `file_stays_under_root` is `reestablish_root`'s pure decision half —
+    // see its own doc comment for why the rest of that function (touching a
+    // real `WebView`/`Window`) isn't unit-tested here.
+    #[test]
+    fn file_stays_under_root_is_true_for_a_file_inside_the_new_root() {
+        assert!(file_stays_under_root(
+            Some(Path::new("/new/root/sub/doc.md")),
+            Path::new("/new/root"),
+        ));
+    }
+
+    #[test]
+    fn file_stays_under_root_is_true_for_a_file_directly_in_the_new_root() {
+        assert!(file_stays_under_root(
+            Some(Path::new("/new/root/doc.md")),
+            Path::new("/new/root"),
+        ));
+    }
+
+    #[test]
+    fn file_stays_under_root_is_false_for_a_file_outside_the_new_root() {
+        assert!(!file_stays_under_root(
+            Some(Path::new("/elsewhere/doc.md")),
+            Path::new("/new/root"),
+        ));
+    }
+
+    #[test]
+    fn file_stays_under_root_is_false_for_a_sibling_path_sharing_a_prefix() {
+        // `/new/root-2/doc.md` textually starts with "/new/root" as a
+        // *string*, but not as a `Path` component prefix — must not be
+        // mistaken for something inside `/new/root`.
+        assert!(!file_stays_under_root(
+            Some(Path::new("/new/root-2/doc.md")),
+            Path::new("/new/root"),
+        ));
+    }
+
+    #[test]
+    fn file_stays_under_root_is_false_when_no_file_is_open() {
+        assert!(!file_stays_under_root(None, Path::new("/new/root")));
+    }
+}

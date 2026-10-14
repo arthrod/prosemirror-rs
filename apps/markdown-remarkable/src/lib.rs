@@ -1,0 +1,22 @@
+//! Library crate for `markdown-remarkable`: a tiny Markdown viewer that
+//! renders a file to GitHub-flavored HTML, serves it locally, and
+//! live-reloads on save.
+//!
+//! The `markdown-remarkable` binary (`src/main.rs`) is a thin wrapper around these
+//! modules; the modules themselves are exposed here so integration tests can
+//! exercise them directly.
+//!
+//! The ProseMirror document for an open file is [`remarkable_engine`]. Routing
+//! exposes it at `GET /engine` and `POST /engine/steps`. A later step batch
+//! continues from the held document while the file bytes are unchanged.
+//! HTML rendering is still [`render`], so review hashes stay tied to the source text.
+
+pub mod app;
+pub mod nav_history;
+pub mod render;
+pub mod review;
+pub mod routes;
+pub mod server;
+pub mod util;
+pub mod watch;
+pub mod window_state;
