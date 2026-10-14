@@ -299,17 +299,24 @@ fn destination(url: &str) -> String {
 }
 
 fn escape_text(text: &str, gfm: bool) -> String {
+    let chars: Vec<char> = text.chars().collect();
     let mut out = String::new();
-    for ch in text.chars() {
-        // `<`, `>`, and `&` reparse as HTML or entities. `~` is strikethrough
-        // only in GFM; CommonMark leaves it alone.
-        if matches!(ch, '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '&') || (gfm && ch == '~')
-        {
+    for (index, ch) in chars.iter().copied().enumerate() {
+        // `<`, `>`, and `&` reparse as HTML or entities. A `~` is strikethrough
+        // in GFM, except a single tilde sitting inside a word (`a~b`).
+        let escape_tilde = gfm && ch == '~' && !tilde_inside_word(&chars, index);
+        if matches!(ch, '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '&') || escape_tilde {
             out.push('\\');
         }
         out.push(ch);
     }
     out
+}
+
+fn tilde_inside_word(chars: &[char], index: usize) -> bool {
+    let prev_word = index > 0 && chars[index - 1].is_alphanumeric();
+    let next_word = chars.get(index + 1).is_some_and(|ch| ch.is_alphanumeric());
+    prev_word && next_word
 }
 
 fn render_inline_code(value: &str) -> String {

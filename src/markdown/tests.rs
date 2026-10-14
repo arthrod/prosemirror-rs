@@ -630,6 +630,38 @@ fn literal_markers_stay_text() {
 }
 
 #[test]
+fn a_tilde_inside_a_word_is_not_escaped() {
+    let remark = gfm();
+    let schema = remark.schema();
+    let doc = node(
+        &schema,
+        json!({
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [{ "type": "text", "text": "a~b" }]
+            }]
+        }),
+    );
+    assert_eq!(remark.serialize(&doc), "a~b\n");
+    let struck = node(
+        &schema,
+        json!({
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [{ "type": "text", "text": "~literal~" }]
+            }]
+        }),
+    );
+    let serialized = remark.serialize(&struck);
+    assert_eq!(serialized, "\\~literal\\~\n");
+    let again = remark.parse(&serialized);
+    assert_eq!(remark_text(&again), "~literal~");
+    assert!(!marks_of(&again).iter().any(|name| name == "strikethrough"));
+}
+
+#[test]
 fn heading_with_an_image_is_schema_valid() {
     let parsed = cm().parse("# Hello ![a](https://example.test)\n");
     let json = parsed.to_json();
