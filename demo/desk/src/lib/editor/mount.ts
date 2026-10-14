@@ -188,6 +188,12 @@ const queue: { steps: import("prosemirror-transform").Step[]; from: "a" | "b" }[
     }, 200);
   }
 
+  function dropQueue() {
+    window.clearTimeout(timer);
+    timer = 0;
+    queue.length = 0;
+  }
+
   function flush() {
     if (dead) return;
     const batch = queue.splice(0, queue.length);
@@ -260,8 +266,11 @@ const queue: { steps: import("prosemirror-transform").Step[]; from: "a" | "b" }[
 
   return {
     destroy() {
-      dead = true;
       window.clearTimeout(timer);
+      timer = 0;
+      if (!dead && primary) flush();
+      dead = true;
+      dropQueue();
       primary?.destroy();
       secondary?.destroy();
       primary = null;
@@ -273,15 +282,16 @@ const queue: { steps: import("prosemirror-transform").Step[]; from: "a" | "b" }[
     },
     focusRange(from, to) {
       if (!primary) return;
-      const max = primary.state.doc.content.size;
-      const pos = Math.min(Math.max(from + 1, 1), Math.max(1, max));
-      const sel = TextSelection.near(primary.state.doc.resolve(pos));
+      const doc = primary.state.doc;
+      const max = doc.content.size;
+      const clamp = (pos: number) => Math.max(0, Math.min(Number.isFinite(pos) ? pos : 0, max));
+      const sel = TextSelection.between(doc.resolve(clamp(from)), doc.resolve(clamp(to)), 1);
       primary.dispatch(primary.state.tr.setSelection(sel).scrollIntoView());
       primary.focus();
-      void to;
     },
     replaceBody(body) {
       if (!primary) return;
+      dropQueue();
       const doc = docFromBody(opts.kind, body);
       for (const view of [primary, secondary]) {
         if (!view) continue;

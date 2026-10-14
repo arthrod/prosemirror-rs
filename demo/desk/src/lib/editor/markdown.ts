@@ -25,10 +25,14 @@ export const markdownParser = new MarkdownParser(schema, tokenizer, {
   },
   ordered_list: {
     block: "ordered_list",
-    getAttrs: (tok, tokens, i) => ({
-      order: Number(tok.attrGet("start") || 1) || 1,
-      tight: listIsTight(tokens, i),
-    }),
+    getAttrs: (tok, tokens, i) => {
+      const raw = tok.attrGet("start");
+      const parsed = raw == null || raw === "" ? 1 : Number(raw);
+      return {
+        order: Number.isFinite(parsed) ? parsed : 1,
+        tight: listIsTight(tokens, i),
+      };
+    },
   },
   heading: { block: "heading", getAttrs: (tok) => ({ level: Number(tok.tag.slice(1)) }) },
   code_block: { block: "code_block", noCloseToken: true },
@@ -106,11 +110,14 @@ export const markdownSerializer = new MarkdownSerializer(
       });
     },
     ordered_list(state, node) {
-      const start = (node.attrs.order as number) || 1;
+      const raw = Number(node.attrs.order);
+      const start = Number.isFinite(raw) ? raw : 1;
       const maxW = String(start + node.childCount - 1).length;
       state.renderList(node, " ".repeat(maxW + 2), (i) => {
+        const child = node.child(i);
         const nStr = String(start + i);
-        return `${" ".repeat(maxW - nStr.length)}${nStr}. `;
+        const marker = child.attrs.checked === true ? "[x] " : child.attrs.checked === false ? "[ ] " : "";
+        return `${" ".repeat(maxW - nStr.length)}${nStr}. ${marker}`;
       });
     },
     list_item(state, node) {
@@ -140,11 +147,21 @@ export const markdownSerializer = new MarkdownSerializer(
       state.text(node.text || "", true);
     },
     table(state, node) {
+      const cellText = (cell: PMNode) => {
+        const para = schema.nodes.paragraph.create(null, cell.content);
+        const doc = schema.nodes.doc.create(null, [para]);
+        return markdownSerializer
+          .serialize(doc)
+          .replace(/\s+$/, "")
+          .replace(/\|/g, "\\|")
+          .replace(/\n/g, " ")
+          .trim();
+      };
       const rows: string[][] = [];
       node.forEach((row) => {
         const cells: string[] = [];
         row.forEach((cell) => {
-          cells.push(cell.textContent.replace(/\|/g, "\\|").replace(/\n/g, " ").trim());
+          cells.push(cellText(cell));
         });
         rows.push(cells);
       });
@@ -211,8 +228,19 @@ export function splitFrontmatter(text: string): { frontmatter: string; body: str
   return { frontmatter: normalized.slice(0, end), body: normalized.slice(end).replace(/^\n/, "") };
 }
 
-export function stripHtmlComments(text: string): string {
-  return text.replace(/<!--[\s\S]*?-->/g, "");
+export function parseMarkdown(text: string): PMNode {
+  const stripped = text.replace(/\r\n/g, "\n").replace(/^\n+/, "");
+  if (!stripped.trim()) return schema.nodes.doc.createAndFill()!;
+  let doc: PMNode;
+  try {
+    doc = markdownParser.parse(stripped);
+  } catch {
+    doc = schema.nodes.doc.create(null, [
+      schema.nodes.paragraph.create(null, schema.text(stripped)),
+    ]);
+  }
+  if (!doc || !doc.childCount) return schema.nodes.doc.createAndFill()!;
+  return rewriteListItems(doc);
 }
 
 function rewriteListItems(node: PMNode): PMNode {
@@ -247,21 +275,6 @@ function applyTask(node: PMNode): PMNode {
     itemKids,
     node.marks,
   );
-}
-
-export function parseMarkdown(text: string): PMNode {
-  const stripped = stripHtmlComments(text).replace(/\r\n/g, "\n").replace(/^\n+/, "");
-  if (!stripped.trim()) return schema.nodes.doc.createAndFill()!;
-  let doc: PMNode;
-  try {
-    doc = markdownParser.parse(stripped);
-  } catch {
-    doc = schema.nodes.doc.create(null, [
-      schema.nodes.paragraph.create(null, schema.text(stripped)),
-    ]);
-  }
-  if (!doc || !doc.childCount) return schema.nodes.doc.createAndFill()!;
-  return rewriteListItems(doc);
 }
 
 export function serializeMarkdown(doc: PMNode): string {

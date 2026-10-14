@@ -1,6 +1,6 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Copy, Download, Trash2 } from "lucide-react";
-import { anchorsFor, anchorAt } from "@/lib/editor/anchors";
+import { anchorsFor } from "@/lib/editor/anchors";
 import { docFromBody } from "@/lib/editor/markdown";
 import { editorBridge } from "@/lib/editor/mount";
 import { exportPath, exportReview, sidecarPath, unanchored } from "@/lib/review/export";
@@ -21,6 +21,7 @@ export function ReviewPane() {
   const notify = useWorkspace((state) => state.notify);
   const [draft, setDraft] = useState("");
   const [editing, setEditing] = useState<string | null>(null);
+  const editingHash = useRef<string | null>(null);
 
   const anchors = useMemo(() => {
     if (!file || file.kind === "folder") return [] as Anchor[];
@@ -41,7 +42,7 @@ export function ReviewPane() {
   function save() {
     if (!draft.trim()) return;
     if (editing) {
-      updateComment(selected ? selected.hash : null, editing, draft);
+      updateComment(editingHash.current, editing, draft);
       setEditing(null);
     } else if (selected) {
       addComment(selected.hash, selected.excerpt, selected.kind, draft);
@@ -103,6 +104,7 @@ export function ReviewPane() {
             key={comment.id}
             comment={comment}
             onEdit={() => {
+              editingHash.current = selected ? selected.hash : null;
               setEditing(comment.id);
               setDraft(comment.text);
             }}
@@ -157,12 +159,11 @@ export function ReviewPane() {
                     <button
                       type="button"
                       onClick={() => {
-                        const live = selected ?? anchorAt(anchors, anchors[0]?.from ?? 0);
-                        if (!live) {
+                        if (!selected) {
                           notify("Select a block first");
                           return;
                         }
-                        reattach(hash, { hash: live.hash, excerpt: live.excerpt, kind: live.kind });
+                        reattach(hash, { hash: selected.hash, excerpt: selected.excerpt, kind: selected.kind });
                       }}
                     >
                       Attach to selection

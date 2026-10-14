@@ -3,9 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite --host 0.0.0.0 --port 5173",
+    "dev": "vite --host localhost --port 5173",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview --host 0.0.0.0 --port 5173",
+    "preview": "vite preview --host localhost --port 5173",
     "test": "node --experimental-strip-types --test src/lib/review/export.test.ts"
   },
   "dependencies": {

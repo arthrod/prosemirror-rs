@@ -5,7 +5,7 @@ export function downloadText(filename: string, content: string, type: string) {
   link.href = url;
   link.download = filename;
   link.click();
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 export function standaloneHtml(title: string, bodyHtml: string) {

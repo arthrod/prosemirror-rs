@@ -245,11 +245,17 @@ export const plainSchema = new Schema({
 export const imagePolicy = { allowRemote: false };
 
 const BAD_LINK = /^(javascript|vbscript|file|data):/i;
+/** ASCII whitespace browsers ignore inside a URL scheme. */
+const SCHEME_WS = /[\t\n\f\r\v ]/g;
 
 export function sanitizeHref(href: string): string {
   const trimmed = href.trim();
   if (!trimmed) return "";
-  if (BAD_LINK.test(trimmed)) return "#";
+  const colon = trimmed.indexOf(":");
+  const rawScheme = colon === -1 ? trimmed : trimmed.slice(0, colon);
+  const scheme = rawScheme.replace(SCHEME_WS, "");
+  const candidate = colon === -1 ? scheme : `${scheme}:${trimmed.slice(colon + 1)}`;
+  if (BAD_LINK.test(candidate)) return "#";
   return trimmed;
 }
 

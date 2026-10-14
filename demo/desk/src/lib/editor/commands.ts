@@ -91,24 +91,43 @@ export function insertImage(src: string, alt: string): Command {
 export function findNext(doc: PMNode, query: string, start: number): { from: number; to: number } | null {
   const q = query.trim().toLowerCase();
   if (!q) return null;
-  let wrapped: { from: number; to: number } | null = null;
-  let found: { from: number; to: number } | null = null;
+  type Piece = { text: string; from: number };
+  const runs: Piece[][] = [];
+  let run: Piece[] | null = null;
+  const close = () => {
+    if (run && run.length) runs.push(run);
+    run = null;
+  };
   doc.descendants((node, pos) => {
-    if (!node.isText || !node.text || found) return;
-    const text = node.text.toLowerCase();
-    let i = text.indexOf(q);
-    while (i >= 0) {
-      const from = pos + i;
-      const hit = { from, to: from + q.length };
-      if (!wrapped) wrapped = hit;
-      if (from >= start) {
-        found = hit;
-        return false;
-      }
-      i = text.indexOf(q, i + 1);
+    if (node.isText) {
+      (run ??= []).push({ text: node.text || "", from: pos });
+      return false;
     }
+    // A non-text node ends a run of adjacent text (marks do not).
+    close();
+    return !node.isLeaf;
   });
-  return found ?? wrapped;
+  close();
+
+  let wrapped: { from: number; to: number } | null = null;
+  for (const pieces of runs) {
+    let flat = "";
+    const origins: number[] = [];
+    for (const piece of pieces) {
+      for (let i = 0; i < piece.text.length; i++) origins.push(piece.from + i);
+      flat += piece.text;
+    }
+    const hay = flat.toLowerCase();
+    let at = hay.indexOf(q);
+    while (at >= 0) {
+      const from = origins[at];
+      const to = origins[at + q.length - 1] + 1;
+      if (from >= start) return { from, to };
+      if (!wrapped) wrapped = { from, to };
+      at = hay.indexOf(q, at + 1);
+    }
+  }
+  return wrapped;
 }
 
 export function markdownKeymap() {

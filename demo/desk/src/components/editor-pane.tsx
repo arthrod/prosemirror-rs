@@ -1,5 +1,6 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { editorBridge, mountEditor } from "@/lib/editor/mount";
+import { imagePolicy } from "@/lib/editor/schema";
 import { currentFile, useWorkspace } from "@/lib/store";
 import type { FileKind } from "@/lib/review/types";
 
@@ -19,6 +20,7 @@ export const EditorPane = memo(function EditorPane({ fileId, kind, collab, allow
   useEffect(() => {
     const node = host.current;
     if (!node) return;
+    imagePolicy.allowRemote = allowRemote;
     const file = currentFile(useWorkspace.getState());
     if (!file || file.id !== fileId) return;
     let handle: ReturnType<typeof mountEditor> | null = null;

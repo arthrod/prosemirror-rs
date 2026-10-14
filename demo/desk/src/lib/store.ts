@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import { sampleFiles } from "./sample.ts";
+import { splitFrontmatter } from "./editor/markdown.ts";
 import { commentId, emptyReview, type AnchorKind, type ReviewDoc } from "./review/types.ts";
 import {
   defaultPrefs,
@@ -248,13 +249,10 @@ export const useWorkspace = create<State>()(
           created: new Date().toISOString(),
           updated: new Date().toISOString(),
         };
-        if (kind === "markdown" && file.body.startsWith("---\n")) {
-          const end = file.body.indexOf("\n---", 4);
-          if (end > 0) {
-            const splitAt = file.body.indexOf("\n", end + 4);
-            file.frontmatter = file.body.slice(0, splitAt > 0 ? splitAt + 1 : undefined);
-            file.body = splitAt > 0 ? file.body.slice(splitAt + 1) : "";
-          }
+        if (kind === "markdown") {
+          const split = splitFrontmatter(file.body);
+          file.frontmatter = split.frontmatter;
+          file.body = split.body;
         }
         set((state) => ({ files: [...state.files, file] }));
         get().open(id);
@@ -413,22 +411,51 @@ export const useWorkspace = create<State>()(
         };
       },
       storage: createJSONStorage(() => ({
-        getItem: (name) => localStorage.getItem(name),
+        getItem: (name) => {
+          try {
+            return localStorage.getItem(name);
+          } catch {
+            return null;
+          }
+        },
         setItem: (name, value) => {
+          pendingKey = name;
           pendingWrite = value;
           window.clearTimeout(writeTimer);
-          writeTimer = window.setTimeout(() => {
-            if (pendingWrite != null) localStorage.setItem(name, pendingWrite);
-          }, 250);
+          writeTimer = window.setTimeout(flushPendingStorage, 250);
         },
-        removeItem: (name) => localStorage.removeItem(name),
+        removeItem: (name) => {
+          try {
+            localStorage.removeItem(name);
+          } catch {
+            // Storage can be disabled.
+          }
+        },
       })),
     },
   ),
 );
 
 let pendingWrite: string | null = null;
+let pendingKey: string | null = null;
 let writeTimer = 0;
+
+function flushPendingStorage() {
+  if (pendingWrite == null || pendingKey == null) return;
+  window.clearTimeout(writeTimer);
+  writeTimer = 0;
+  try {
+    localStorage.setItem(pendingKey, pendingWrite);
+    pendingWrite = null;
+  } catch {
+    // Quota exceeded or storage blocked. Leave the pending value for a later flush.
+  }
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", flushPendingStorage);
+  window.addEventListener("beforeunload", flushPendingStorage);
+}
 
 export function currentFile(state: Pick<State, "files" | "currentId">) {
   return state.files.find((file) => file.id === state.currentId) ?? null;

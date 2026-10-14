@@ -6,7 +6,9 @@ import { exportPath, exportReview, unanchored } from "./export.ts";
 import { emptyReview, type Anchor, type ReviewDoc } from "./types.ts";
 import { parseMarkdown, serializeMarkdown, splitFrontmatter } from "../editor/markdown.ts";
 import { anchorsFor } from "../editor/anchors.ts";
+import { findNext } from "../editor/commands.ts";
 import { sanitizeHref } from "../editor/schema.ts";
+import { TextSelection } from "prosemirror-state";
 
 describe("review hashes", () => {
   it("matches SHA-256 truncated to 16 hex chars", () => {
@@ -56,9 +58,50 @@ describe("markdown round trip", () => {
     assert.match(serialized, /\\\[x\\\]\(javascript:alert\(1\)\)/);
     assert.doesNotMatch(serialized, /(?<!\\)\]\(javascript:/);
     assert.equal(sanitizeHref("javascript:alert(1)"), "#");
+    assert.equal(sanitizeHref("java\tscript:alert(1)"), "#");
+    assert.equal(sanitizeHref("java\nscript:alert(1)"), "#");
+    assert.equal(sanitizeHref("https://example.com/a b"), "https://example.com/a b");
     const split = splitFrontmatter("---\ntitle: Hi\n---\n\n# Body\n");
     assert.match(split.frontmatter, /^---/);
     assert.match(split.body, /^# Body/);
+    const dotted = splitFrontmatter("---\ntitle: Hi\n...\n\n# Body\n");
+    assert.match(dotted.frontmatter, /^\s*---[\s\S]*\.\.\.\s*$/);
+    assert.match(dotted.body, /^# Body/);
+  });
+
+  it("keeps ordered-list starts, task markers, table marks, and fenced comments", () => {
+    const ordered = serializeMarkdown(parseMarkdown("0. zero\n1. one\n"));
+    assert.match(ordered, /^0\. zero/m);
+    assert.match(ordered, /^1\. one/m);
+    const tasks = serializeMarkdown(parseMarkdown("1. [x] done\n2. [ ] todo\n"));
+    assert.match(tasks, /1\. \[x\] done/);
+    assert.match(tasks, /2\. \[ \] todo/);
+    const table = serializeMarkdown(parseMarkdown("| **a** | b |\n| --- | --- |\n| *c* | `d` |\n"));
+    assert.match(table, /\*\*a\*\*/);
+    assert.match(table, /\*c\*/);
+    assert.match(table, /`d`/);
+    const fenced = "```\n<!-- keep -->\n```";
+    assert.match(serializeMarkdown(parseMarkdown(fenced)), /<!-- keep -->/);
+  });
+
+  it("searches across adjacent text nodes and selects the match", () => {
+    const doc = parseMarkdown("hello **world** there");
+    const hit = findNext(doc, "hello world", 0);
+    assert.ok(hit);
+    assert.equal(doc.textBetween(hit.from, hit.to), "hello world");
+    const sel = TextSelection.between(doc.resolve(hit.from), doc.resolve(hit.to), 1);
+    assert.equal(sel.from, hit.from);
+    assert.equal(sel.to, hit.to);
+    const wrapped = findNext(doc, "hello", hit.to);
+    assert.equal(wrapped && doc.textBetween(wrapped.from, wrapped.to), "hello");
+  });
+
+  it("gives identical blocks distinct review hashes", () => {
+    const doc = parseMarkdown("Same\n\nSame\n");
+    const blocks = anchorsFor(doc, "markdown").filter((anchor) => anchor.kind === "block");
+    assert.equal(blocks.length, 2);
+    assert.notEqual(blocks[0].hash, blocks[1].hash);
+    assert.equal(blocks[0].hash, hashSource(blocks[0].source));
   });
 
   it("numbers ordered-list items on their own lines", () => {

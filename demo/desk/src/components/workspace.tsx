@@ -46,6 +46,7 @@ export function Workspace() {
   const [source, setSource] = useState("");
   const findFrom = useRef(0);
   const marks = useSyncExternalStore(editorChrome.subscribe, editorChrome.getMarks, editorChrome.getMarks);
+  imagePolicy.allowRemote = prefs.allowRemote;
 
   useEffect(() => {
     let stop = false;
@@ -255,7 +256,7 @@ export function Workspace() {
                   return;
                 }
                 findFrom.current = found.to;
-                editorBridge.current?.focusRange(found.from - 1, found.to);
+                editorBridge.current?.focusRange(found.from, found.to);
               }}
             />
           </label>
@@ -371,7 +372,7 @@ function FileMenu({ booted }: { booted: boolean }) {
       <DropdownMenu.Trigger className="tool" title="File">File</DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content className="menu" align="end">
-          <DropdownMenu.Item className="menu-item" onSelect={() => file && downloadText(file.name, joinDocument(file.frontmatter, file.body), "text/markdown")}>
+          <DropdownMenu.Item className="menu-item" onSelect={() => file && downloadText(file.name, joinDocument(file.frontmatter, file.body), file.kind === "plain" ? "text/plain" : "text/markdown")}>
             Download {file?.kind === "plain" ? "text" : "Markdown"}
           </DropdownMenu.Item>
           <DropdownMenu.Item className="menu-item" onSelect={() => exportHtml()}>Download HTML</DropdownMenu.Item>

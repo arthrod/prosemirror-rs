@@ -169,7 +169,7 @@ function itemSource(list: PMNode, item: PMNode, index: number) {
   const wrapper =
     list.type.name === "ordered_list"
       ? schema.nodes.ordered_list.create(
-          { order: ((list.attrs.order as number) || 1) + index, tight: true },
+          { order: listStart(list) + index, tight: true },
           [item],
         )
       : schema.nodes.bullet_list.create({ tight: true, bullet: list.attrs.bullet || "-" }, [item]);
@@ -184,7 +184,7 @@ function serializeBlock(node: PMNode) {
 
 function pushAnchor(anchors: Anchor[], draft: Omit<Anchor, "hash">) {
   const source = draft.source.trim();
-  anchors.push({ ...draft, source, hash: hashSource(source) });
+  anchors.push({ ...draft, source, hash: hashWithOccurrence(anchors, source) });
 }
 
 function plainAnchors(doc: PMNode): Anchor[] {
@@ -197,7 +197,7 @@ function plainAnchors(doc: PMNode): Anchor[] {
     const line = text.slice(0, lineOffset(doc, offset)).split("\n").length;
     anchors.push({
       kind: "block",
-      hash: hashSource(source),
+      hash: hashWithOccurrence(anchors, source),
       source,
       excerpt: [...source].slice(0, 80).join(""),
       lineStart: line,
@@ -208,6 +208,18 @@ function plainAnchors(doc: PMNode): Anchor[] {
     });
   });
   return anchors;
+}
+
+/** Same text keeps the original hash; later copies add a stable occurrence index. */
+function hashWithOccurrence(anchors: { source: string }[], source: string) {
+  let occurrence = 0;
+  for (const anchor of anchors) if (anchor.source === source) occurrence += 1;
+  return hashSource(occurrence === 0 ? source : `${source}\0${occurrence}`);
+}
+
+function listStart(list: PMNode) {
+  const order = Number(list.attrs.order);
+  return Number.isFinite(order) ? order : 1;
 }
 
 function lineOffset(doc: PMNode, offset: number) {
