@@ -1,0 +1,43 @@
+{
+  "name": "prosemirror-desk",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host localhost --port 5173",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host localhost --port 5173",
+    "test": "node --experimental-strip-types --test src/lib/review/export.test.ts"
+  },
+  "dependencies": {
+    "@radix-ui/react-dialog": "^1.1.15",
+    "@radix-ui/react-dropdown-menu": "^2.1.16",
+    "lucide-react": "^0.510.0",
+    "markdown-it": "^14.1.0",
+    "prosemirror-commands": "^1.7.1",
+    "prosemirror-dropcursor": "^1.8.2",
+    "prosemirror-gapcursor": "^1.4.0",
+    "prosemirror-history": "^1.4.1",
+    "prosemirror-inputrules": "^1.5.1",
+    "prosemirror-keymap": "^1.2.3",
+    "prosemirror-markdown": "^1.13.2",
+    "prosemirror-model": "^1.25.3",
+    "prosemirror-schema-list": "^1.5.1",
+    "prosemirror-state": "^1.4.3",
+    "prosemirror-tables": "^1.8.1",
+    "prosemirror-transform": "^1.10.4",
+    "prosemirror-view": "^1.40.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zustand": "^5.0.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.12",
+    "@types/markdown-it": "^14.1.2",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "@vitejs/plugin-react": "^5.0.4",
+    "tailwindcss": "^4.1.12",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.5"
+  }
+}
