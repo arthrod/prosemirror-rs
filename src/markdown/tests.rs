@@ -1,5 +1,6 @@
 use super::{MarkdownDoc, Remark};
 use crate::dynamic::DynamicSchema;
+use crate::editor::Editor;
 use crate::model::Node;
 use serde_json::{json, Value};
 
@@ -542,4 +543,124 @@ fn ordered_list_keeps_start() {
     assert_canonical(cm(), "3. a\n4. b");
     let parsed = cm().parse("3. c\n");
     assert_eq!(parsed.to_json()["content"][0]["attrs"]["start"], json!(3));
+}
+
+#[test]
+fn nested_task_keeps_the_parent_checkbox() {
+    assert_serialize(
+        gfm(),
+        "- [x] parent\n  - [ ] child\n",
+        "* [x] parent\n  * [ ] child\n",
+    );
+}
+
+#[test]
+fn empty_task_keeps_the_checkbox() {
+    let remark = gfm();
+    let schema = remark.schema();
+    let doc = node(
+        &schema,
+        json!({
+            "type": "doc",
+            "content": [{
+                "type": "bullet_list",
+                "content": [{
+                    "type": "task_list_item",
+                    "attrs": { "checked": true },
+                    "content": [{ "type": "paragraph" }]
+                }]
+            }]
+        }),
+    );
+    let serialized = remark.serialize(&doc);
+    assert!(serialized.contains("[x]"), "{serialized}");
+    let again = remark.parse(&serialized);
+    assert!(again.to_json().to_string().contains("task_list_item"));
+}
+
+#[test]
+fn gfm_autolink_does_not_nest_inside_a_link() {
+    let parsed = gfm().parse("[see https://example.test](https://outer.test)\n");
+    let json = parsed.to_json().to_string();
+    assert_eq!(json.matches("\"link\"").count(), 1, "{json}");
+    assert_eq!(
+        gfm().serialize(&parsed.doc),
+        "[see https://example.test](https://outer.test)\n"
+    );
+}
+
+#[test]
+fn link_destination_with_a_paren_round_trips() {
+    let remark = cm();
+    let schema = remark.schema();
+    let doc = node(
+        &schema,
+        json!({
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [{
+                    "type": "text",
+                    "text": "a",
+                    "marks": [{
+                        "type": "link",
+                        "attrs": { "href": "https://example.test/a)b" }
+                    }]
+                }]
+            }]
+        }),
+    );
+    let serialized = remark.serialize(&doc);
+    assert_eq!(serialized, "[a](<https://example.test/a)b>)\n");
+    let again = remark.parse(&serialized);
+    let href = again.to_json()["content"][0]["content"][0]["marks"][0]["attrs"]["href"].clone();
+    assert_eq!(href, json!("https://example.test/a)b"));
+}
+
+#[test]
+fn literal_markers_stay_text() {
+    assert_serialize(cm(), "\\# not a heading\n", "\\# not a heading\n");
+    assert_serialize(cm(), "\\<tag> and AT\\&T\n", "\\<tag\\> and AT\\&T\n");
+    assert_serialize(
+        gfm(),
+        "\\~\\~not struck\\~\\~\n",
+        "\\~\\~not struck\\~\\~\n",
+    );
+    assert_serialize(cm(), "\\- still a paragraph\n", "\\- still a paragraph\n");
+    assert_serialize(cm(), "1\\. not a list\n", "1\\. not a list\n");
+}
+
+#[test]
+fn heading_with_an_image_is_schema_valid() {
+    let parsed = cm().parse("# Hello ![a](https://example.test)\n");
+    let json = parsed.to_json();
+    assert_eq!(json["content"][0]["type"], json!("heading"));
+    assert!(json.to_string().contains("image"), "{json}");
+    parsed
+        .schema
+        .with_types(|| parsed.doc.check())
+        .expect("heading content is inline*");
+    let editor = Editor::new(&cm().schema_json(), &json.to_string()).expect("editor");
+    assert_eq!(editor.version(), 0);
+}
+
+#[test]
+fn code_span_newline_serializes_as_a_space() {
+    let remark = cm();
+    let schema = remark.schema();
+    let doc = node(
+        &schema,
+        json!({
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [{
+                    "type": "text",
+                    "text": "a\nb",
+                    "marks": [{ "type": "code" }]
+                }]
+            }]
+        }),
+    );
+    assert_eq!(remark.serialize(&doc), "`a b`\n");
 }

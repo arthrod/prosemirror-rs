@@ -7,8 +7,9 @@
 //! exercise them directly.
 //!
 //! The ProseMirror document for an open file is [`remarkable_engine`]. Routing
-//! exposes it at `GET /engine` and `POST /engine/steps`. HTML rendering is
-//! still [`render`], so review hashes stay tied to the source text.
+//! exposes it at `GET /engine` and `POST /engine/steps`. A later step batch
+//! continues from the held document while the file bytes are unchanged.
+//! HTML rendering is still [`render`], so review hashes stay tied to the source text.
 
 pub mod app;
 pub mod nav_history;

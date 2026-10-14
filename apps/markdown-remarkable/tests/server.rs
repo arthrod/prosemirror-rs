@@ -653,10 +653,11 @@ fn put_pick_root_ignores_a_path_in_its_body_and_still_501s_in_browser_mode() {
 }
 
 #[test]
-fn put_review_body_over_1_mib_is_413_over_raw_http() {
+fn put_review_body_over_8_mib_is_413_over_raw_http() {
     let harness = start_test_server("# Hi\n");
-    // A JSON body comfortably over the 1 MiB limit.
-    let oversized_text = "x".repeat(2 * 1024 * 1024);
+    // A JSON body comfortably over the 8 MiB body cap, which matches the
+    // largest sidecar `review` will store.
+    let oversized_text = "x".repeat(9 * 1024 * 1024);
     let body = format!(
         r#"{{"version":1,"file":"doc.md","blocks":[{{"hash":"0123456789abcdef","excerpt":"x","comments":[{{"id":"c_1","text":"{oversized_text}","created":"2026-08-22T07:00:00Z","updated":"2026-08-22T07:00:00Z"}}]}}]}}"#
     );

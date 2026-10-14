@@ -39,7 +39,7 @@ server parses each open file with this crate and applies steps through
 [`editor::Editor`](src/editor.rs):
 
 - `GET /engine` — GFM Markdown (or plain text, one paragraph per line) as a ProseMirror document
-- `POST /engine/steps` — a JSON array of steps, applied in Rust and not written back to the file
+- `POST /engine/steps` — a JSON array of steps, applied in Rust to the editor already held for that file. A later batch continues from the edited document while the file bytes are unchanged. Nothing is written back to the file.
 
 The HTML the window shows still comes from remarkable's own renderer, so
 review hashes stay hashes of the source text.

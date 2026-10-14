@@ -191,14 +191,17 @@ fn has_request_header(req: &RouteRequest) -> bool {
 /// - `POST /export` — requires [`REQUEST_HEADER`], writes the review export
 ///   (see [`review::export_path`] for the exact name), and returns its file
 ///   name and contents as JSON.
-/// - `GET /engine` — the open file parsed by the prosemirror-rs editor
+/// - `GET /engine` — the open file as held by the prosemirror-rs editor
 ///   ([`remarkable_engine`]). Markdown uses the GFM remark schema; plain
 ///   text is one paragraph per line, with no Markdown syntax interpreted.
-///   Review HTML is unchanged: anchors stay hashes of the source slices.
+///   A later `POST /engine/steps` for the same path is reflected here while
+///   the file bytes are unchanged. Review HTML is unchanged: anchors stay
+///   hashes of the source slices.
 /// - `POST /engine/steps` — requires [`REQUEST_HEADER`]. Body is a JSON
 ///   array of ProseMirror steps. They are applied by
-///   [`remarkable_engine::apply_steps`] and the resulting
-///   document is returned. The file on disk is not written: serializing
+///   [`remarkable_engine::apply_steps_continuing`] to the editor already
+///   held for this path, so a second batch is not replayed against the
+///   original file. The file on disk is not written: serializing
 ///   back to Markdown drops tables, footnotes, and raw HTML, which would
 ///   move review hashes.
 /// - `GET`/`HEAD /asset?p=<percent-encoded relative path>` — a local image
@@ -1412,6 +1415,10 @@ fn source_kind(path: &Path) -> SourceKind {
     }
 }
 
+fn engine_key(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
 /// `GET /` and `GET /body` already rendered from the source. This only
 /// stamps that the same bytes also loaded in the prosemirror editor.
 /// A failure here does not replace the HTML: review anchors still have to
@@ -1449,7 +1456,7 @@ fn read_for_engine(path: &Path) -> Result<String, Reply> {
 }
 
 /// `GET /engine`: the open file as a ProseMirror document. See
-/// [`remarkable_engine::open`].
+/// [`remarkable_engine::open_continuing`].
 fn handle_engine(file: Option<&Path>) -> Reply {
     let Some(path) = file else {
         return no_file_open();
@@ -1458,7 +1465,7 @@ fn handle_engine(file: Option<&Path>) -> Reply {
         Ok(text) => text,
         Err(reply) => return reply,
     };
-    match remarkable_engine::open(source_kind(path), &text) {
+    match remarkable_engine::open_continuing(&engine_key(path), source_kind(path), &text) {
         Ok(doc) => match serde_json::to_value(&doc) {
             Ok(value) => Reply::json(200, value),
             Err(err) => {
@@ -1473,8 +1480,8 @@ fn handle_engine(file: Option<&Path>) -> Reply {
     }
 }
 
-/// `POST /engine/steps`: apply a JSON array of steps. Does not write the
-/// file. See [`remarkable_engine::apply_steps`].
+/// `POST /engine/steps`: apply a JSON array of steps to the held editor.
+/// Does not write the file. See [`remarkable_engine::apply_steps_continuing`].
 fn handle_engine_steps(req: &RouteRequest, file: Option<&Path>) -> Reply {
     if !has_request_header(req) {
         return error_json(403, "missing X-Mdview-Request header");
@@ -1494,7 +1501,12 @@ fn handle_engine_steps(req: &RouteRequest, file: Option<&Path>) -> Reply {
         Err(reply) => return reply,
     };
     let steps = String::from_utf8_lossy(req.body);
-    match remarkable_engine::apply_steps(source_kind(path), &text, &steps) {
+    match remarkable_engine::apply_steps_continuing(
+        &engine_key(path),
+        source_kind(path),
+        &text,
+        &steps,
+    ) {
         Ok(doc) => match serde_json::to_value(&doc) {
             Ok(value) => Reply::json(200, value),
             Err(err) => {

@@ -86,16 +86,33 @@
       };
     }
 
-    var localResult = probe(window.localStorage);
-    if (localResult === true) {
-      post("storage: ok");
-      return backedBy(window.localStorage);
+    function readArea(read) {
+      try {
+        var area = read();
+        var result = probe(area);
+        if (result === true) return { area: area, name: null };
+        return { area: null, name: result.name };
+      } catch (err) {
+        // The getter itself throws (a locked-down WebView) before probe
+        // can try setItem. That must not abort the rest of this script.
+        return { area: null, name: (err && err.name) || "Error" };
+      }
     }
-    post("storage: unavailable " + localResult.name);
 
-    var sessionResult = probe(window.sessionStorage);
-    if (sessionResult === true) {
-      return backedBy(window.sessionStorage);
+    var local = readArea(function () {
+      return window.localStorage;
+    });
+    if (local.area) {
+      post("storage: ok");
+      return backedBy(local.area);
+    }
+    post("storage: unavailable " + local.name);
+
+    var session = readArea(function () {
+      return window.sessionStorage;
+    });
+    if (session.area) {
+      return backedBy(session.area);
     }
 
     return memoryBacked();

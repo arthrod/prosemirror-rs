@@ -9,12 +9,19 @@
 //!
 //! Applying steps does not write the file. The GFM serializer drops tables,
 //! footnotes, and raw HTML, and writing it back would move the review hashes.
+//!
+//! [`apply_steps`] always reparses `source`. [`open_continuing`] and
+//! [`apply_steps_continuing`] keep the editor for a path while the file
+//! bytes are unchanged, so a later batch is applied to the edited document
+//! instead of the original parse.
 
 use prosemirror::editor::Editor;
 use prosemirror::markdown::Remark;
 use prosemirror::model::Node;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 /// Name reported on `/engine` and `X-Prosemirror-Engine`.
 pub const ENGINE_NAME: &str = "prosemirror-rs";
@@ -85,7 +92,84 @@ fn project(
     if let Some(steps_json) = steps_json {
         ok = editor.apply_steps_json(steps_json)?;
     }
-    snapshot(editor, kind_name, remark, ok)
+    snapshot(&editor, kind_name, remark, ok)
+}
+
+/// One open file's editor, reused while the on-disk bytes do not change.
+struct Held {
+    kind: SourceKind,
+    source: String,
+    editor: Editor,
+    kind_name: &'static str,
+    remark: Option<Remark>,
+}
+
+impl Held {
+    fn open(kind: SourceKind, source: &str) -> Result<Self, String> {
+        let (editor, kind_name, remark) = session(kind, source)?;
+        Ok(Self {
+            kind,
+            source: source.to_string(),
+            editor,
+            kind_name,
+            remark,
+        })
+    }
+
+    fn matches(&self, kind: SourceKind, source: &str) -> bool {
+        self.kind == kind && self.source == source
+    }
+}
+
+static HELD: LazyLock<Mutex<HashMap<String, Held>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn with_held<T>(
+    key: &str,
+    kind: SourceKind,
+    source: &str,
+    body: impl FnOnce(&mut Held) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut guard = HELD
+        .lock()
+        .map_err(|_| "engine session lock poisoned".to_string())?;
+    let reuse = guard
+        .get(key)
+        .is_some_and(|held| held.matches(kind, source));
+    if !reuse {
+        guard.insert(key.to_string(), Held::open(kind, source)?);
+    }
+    let held = guard.get_mut(key).expect("session inserted");
+    body(held)
+}
+
+/// Parse `source`, or return the editor already held for `key` when the
+/// file bytes are unchanged.
+pub fn open_continuing(
+    key: &str,
+    kind: SourceKind,
+    source: &str,
+) -> Result<DocumentEngine, String> {
+    with_held(key, kind, source, |held| {
+        snapshot(&held.editor, held.kind_name, held.remark, true)
+    })
+}
+
+/// Like [`apply_steps`], but a second call with the same `key` and `source`
+/// continues from the document the previous call left behind.
+pub fn apply_steps_continuing(
+    key: &str,
+    kind: SourceKind,
+    source: &str,
+    steps_json: &str,
+) -> Result<DocumentEngine, String> {
+    let trimmed = steps_json.trim();
+    if trimmed.is_empty() {
+        return Err("steps must be a JSON array".into());
+    }
+    with_held(key, kind, source, |held| {
+        let ok = held.editor.apply_steps_json(trimmed)?;
+        snapshot(&held.editor, held.kind_name, held.remark, ok)
+    })
 }
 
 fn session(
@@ -109,7 +193,7 @@ fn session(
 }
 
 fn snapshot(
-    editor: Editor,
+    editor: &Editor,
     kind_name: &'static str,
     remark: Option<Remark>,
     ok: bool,
@@ -228,5 +312,55 @@ mod tests {
     fn invalid_steps_are_an_error() {
         let err = apply_steps(SourceKind::Markdown, "Hi\n", "not-json").unwrap_err();
         assert!(err.contains("Invalid steps JSON"), "{err}");
+    }
+
+    #[test]
+    fn a_later_batch_continues_from_the_edited_document() {
+        let key = "continuing-hi";
+        let first = apply_steps_continuing(
+            key,
+            SourceKind::Markdown,
+            "Hi\n",
+            r#"[{"stepType":"replace","from":3,"to":3,"slice":{"content":[{"type":"text","text":"!"}]}}]"#,
+        )
+        .expect("first");
+        assert_eq!(first.text, "Hi!");
+        assert_eq!(first.version, 1);
+        let second = apply_steps_continuing(
+            key,
+            SourceKind::Markdown,
+            "Hi\n",
+            r#"[{"stepType":"replace","from":4,"to":4,"slice":{"content":[{"type":"text","text":"?"}]}}]"#,
+        )
+        .expect("second");
+        assert!(second.ok);
+        assert_eq!(second.version, 2);
+        assert_eq!(second.text, "Hi!?");
+        let seen = open_continuing(key, SourceKind::Markdown, "Hi\n").expect("open");
+        assert_eq!(seen.text, "Hi!?");
+        assert_eq!(seen.version, 2);
+    }
+
+    #[test]
+    fn a_changed_file_drops_the_held_document() {
+        let key = "reset-on-write";
+        let first = apply_steps_continuing(
+            key,
+            SourceKind::Markdown,
+            "Hi\n",
+            r#"[{"stepType":"replace","from":3,"to":3,"slice":{"content":[{"type":"text","text":"!"}]}}]"#,
+        )
+        .expect("first");
+        assert_eq!(first.text, "Hi!");
+        let second = apply_steps_continuing(
+            key,
+            SourceKind::Markdown,
+            "Yo\n",
+            r#"[{"stepType":"replace","from":3,"to":3,"slice":{"content":[{"type":"text","text":"!"}]}}]"#,
+        )
+        .expect("second");
+        assert!(second.ok);
+        assert_eq!(second.version, 1);
+        assert_eq!(second.text, "Yo!");
     }
 }

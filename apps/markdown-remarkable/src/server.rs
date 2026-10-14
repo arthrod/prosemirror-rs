@@ -19,11 +19,12 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tiny_http::{Header, Method, Request, Response, Server};
 
-/// The largest request body accepted by any route. Only `PUT /review`
-/// actually has one; everything else ignores whatever a client sends. Big
-/// enough for a very large review document, small enough that a malicious
-/// or buggy client can't force unbounded memory use.
-const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// The largest request body accepted by any route. `PUT /review` is the
+/// one that needs the room: a sidecar may be up to 8 MiB
+/// (`review::MAX_TOTAL_SIDECAR_BYTES` is the same bound). `POST
+/// /engine/steps` shares the cap. Big enough for that review document,
+/// small enough that a client can't force unbounded memory use.
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Binds a `tiny_http` server on `127.0.0.1:<port>`. Pass `0` to let the OS
 /// assign an available port; the actual bound address is available via

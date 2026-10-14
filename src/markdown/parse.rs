@@ -135,12 +135,15 @@ impl<'a> Cursor<'a> {
         let start = self.next().map(|(_, range)| range.start);
         let inlines = self.parse_inlines(|end| matches!(end, TagEnd::Paragraph));
         let _ = start;
-        Block::Paragraph(inlines)
+        Block::Paragraph(finish_inlines(inlines, self.gfm))
     }
 
     fn parse_heading(&mut self, level: HeadingLevel) -> Block {
         self.next();
-        let children = self.parse_inlines(|end| matches!(end, TagEnd::Heading(_)));
+        let children = finish_inlines(
+            self.parse_inlines(|end| matches!(end, TagEnd::Heading(_))),
+            self.gfm,
+        );
         Block::Heading {
             level: heading_level(level),
             children,
@@ -217,6 +220,9 @@ impl<'a> Cursor<'a> {
     }
 
     fn parse_item_body(&mut self) -> (Item, Vec<Range<usize>>) {
+        // Nested items parse through this same field. Restore the parent
+        // marker after the body is captured, or a child wipes the checkbox.
+        let saved_task = self.task_checked;
         self.task_checked = None;
         let mut blocks = Vec::new();
         let mut child_ranges = Vec::new();
@@ -346,14 +352,16 @@ impl<'a> Cursor<'a> {
         if blocks.is_empty() {
             blocks.push(Block::Paragraph(Vec::new()));
         }
-        (
+        let item = (
             Item {
                 spread: false,
                 checked: self.task_checked,
                 children: blocks,
             },
             child_ranges,
-        )
+        );
+        self.task_checked = saved_task;
+        item
     }
 
     fn parse_inlines(&mut self, stop: impl Fn(&TagEnd) -> bool) -> Vec<Inline> {
@@ -376,7 +384,9 @@ impl<'a> Cursor<'a> {
                 self.next();
             }
         }
-        finish_inlines(inlines, self.gfm)
+        // Autolink once, at the paragraph or heading. Doing it here would
+        // also turn URLs inside an existing link label into nested links.
+        merge_text(inlines)
     }
 
     fn parse_inline(&mut self) -> Option<Inline> {
@@ -657,11 +667,8 @@ fn split_autolinks(text: &str, out: &mut Vec<Inline>) {
             index = found.end;
             chunk_start = found.end;
         } else {
-            index += text[index..]
-                .chars()
-                .next()
-                .map(|ch| ch.len_utf8())
-                .unwrap_or(1);
+            // `find_autolink` already scanned the rest of the string.
+            break;
         }
     }
     if chunk_start < text.len() {

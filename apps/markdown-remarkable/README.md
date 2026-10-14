@@ -14,7 +14,9 @@ at the commit in `UPSTREAM`. Rendering, review sidecars, and export are the
 same. The backend document engine is prosemirror-rs: `GET /engine` returns
 the open file as a ProseMirror document (GFM for Markdown, one paragraph per
 line for plain text), and `POST /engine/steps` applies a JSON array of steps
-through `prosemirror::editor::Editor`. Steps are not written back to the
+to the editor held for that path. A second batch continues from the edited
+document while the file is unchanged. Steps go through
+`prosemirror::editor::Editor` and are not written back to the
 file, so review hashes stay on the source text.
 
 ## Why

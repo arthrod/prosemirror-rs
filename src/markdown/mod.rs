@@ -140,7 +140,7 @@ impl Remark {
     /// the whole list, matching `isListSpread`.
     #[must_use]
     pub fn serialize(self, doc: &DynamicNode) -> String {
-        stringify::stringify_doc(&convert::node_to_doc(doc))
+        stringify::stringify_doc(&convert::node_to_doc(doc), self.flavor == Flavor::Gfm)
     }
 }
 
