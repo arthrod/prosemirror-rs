@@ -17,7 +17,7 @@ const binding = { ...wasmModule };
 // Apply JS-side patches (Fragment.from, Slice.empty, etc.)
 // These are shared with the napi back-end.
 import { patchStatics } from "../patch.js";
-patchStatics(binding);
+patchStatics(binding, { wasm: true });
 
 // Merge DOM types
 import * as dom from "../dom.js";

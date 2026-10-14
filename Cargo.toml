@@ -1,5 +1,6 @@
 [workspace]
-members = ["python", "node", "wasm"]
+members = ["python", "node", "wasm", "desktop/core"]
+exclude = ["desktop/src-tauri"]
 resolver = "2"
 
 [package]
@@ -28,6 +29,7 @@ displaydoc = "0.2"
 derive-new = "0.5"
 serde_json = { version = "1.0.53", features = ["preserve_order"] }
 indexmap = { version = "2.14.0", features = ["serde"] }
+pulldown-cmark = "0.13.4"
 
 [dependencies.serde]
 version = "1.0.97"

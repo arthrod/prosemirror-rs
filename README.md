@@ -30,6 +30,19 @@ ProseMirror packages automatically use the Rust implementation.
 - **Advanced** — two side-by-side editors with simulated real-time collaboration
   and tables.
 
+### Desktop
+
+[`desktop/`](desktop) is the same two editors as a [Tauri 2.12](https://v2.tauri.app/)
+executable. The webview aliases `prosemirror-model` and `prosemirror-transform`
+to the Rust WebAssembly build, and the native process links this crate directly.
+
+```bash
+cd desktop
+npm install
+npm run build:wasm
+npm run desktop
+```
+
 ## Quick start
 
 ### Add to your project
@@ -69,6 +82,37 @@ cargo test --lib
 # Run a specific test
 cargo test test_resolve
 ```
+
+## Markdown
+
+[`prosemirror::markdown`](src/markdown/mod.rs) ports
+[prosemirror-remark](https://github.com/arthrod/prosemirror-remark): a CommonMark
+and GitHub Flavored Markdown schema plus bidirectional conversion. Parsing uses
+[pulldown-cmark](https://docs.rs/pulldown-cmark), the same engine as
+[markdown-remarkable](https://github.com/arthrod/markdown-remarkable). Output
+matches `remark-stringify` with `fences: true`, `listItemIndent: "one"`,
+`rule: "-"`, and `*` bullets.
+
+```rust
+use prosemirror::markdown::Remark;
+
+let remark = Remark::gfm();
+let parsed = remark.parse("- [x] done\n");
+assert_eq!(remark.serialize(&parsed.doc), "* [x] done\n");
+```
+
+Node and mark names match `prosemirror-remark` (`paragraph`, `heading`,
+`bullet_list`, `task_list_item`, `link`, `strikethrough`, …).
+[`Editor`](src/markdown/edit.rs) runs the syntax-extension input rules and
+keymap on that schema: headings, lists, task items, marks, code blocks, rules,
+and hard breaks. [`parse_dom`](src/markdown/dom.rs) / [`to_dom`](src/markdown/dom.rs)
+follow the `parseDOM` / `toDOM` specs, including the task-list checkbox.
+There is no browser view, so scrolling and layout-sensitive `endOfTextblock`
+are not represented; `is_at_start` uses the no-view fallback
+(`parentOffset == 0`).
+
+Same gaps as upstream: raw HTML is dropped, a fenced code block's info string
+is not stored, and tables and footnotes are not in the schema.
 
 ## Performance
 
